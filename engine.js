@@ -25,6 +25,9 @@ async function appendLog(type, text) {
 
 // content.js와 메시지 통신
 chrome.runtime.onMessage.addListener((msg, sender, sendResponse) => {
+  if (msg.action?.startsWith('AUTH_')) {
+    accountAuthRequest(msg,sender).then(sendResponse,error=>sendResponse({ok:false,error:error.message}));return true;
+  }
   if (msg.action === 'CLAIM_TASK_ACTION') {
     claimTaskAction(msg.taskAction, msg.expected).then(
       granted => sendResponse({ granted }),
@@ -54,8 +57,8 @@ chrome.runtime.onMessage.addListener((msg, sender, sendResponse) => {
 // 다운로드 이벤트가 겹쳐도 한 곡의 결과와 계정 전환은 한 번만 처리합니다.
 chrome.downloads.onCreated.addListener(async (downloadItem) => {
   const data = await withStateLock(async () => {
-    const current = await chrome.storage.local.get(['isRunning', 'step', 'songs', 'songIndex', 'accounts', 'currentIndex', 'accountResults', 'runId', 'downloadEventId', 'downloadReceivedAt', 'logs']);
-    if (!current.isRunning || (downloadItem.expected && !sameTask(current, downloadItem.expected))) return null;
+    const current = await chrome.storage.local.get(['isRunning', 'step', 'songs', 'songIndex', 'accounts', 'currentIndex', 'accountResults', 'runId', 'verifiedSession', 'downloadEventId', 'downloadReceivedAt', 'logs']);
+    if (!current.isRunning || !verifiedFor(current) || (downloadItem.expected && !sameTask(current, downloadItem.expected))) return null;
     const replay = current.step === 'DOWNLOAD_RECEIVED' && current.downloadEventId === downloadItem.id;
     if (!replay && !downloadSteps.includes(current.step)) return null;
     const index = current.songIndex || 0;
@@ -129,7 +132,7 @@ async function handleAccountRollover(reason, isError, expected) {
 }
 
 async function performAccountRollover(reason, isError, expected) {
-  const data = await chrome.storage.local.get(['isRunning', 'accounts', 'currentIndex', 'accountResults', 'runId', 'songIndex', 'step']);
+  const data = await chrome.storage.local.get(['isRunning', 'accounts', 'currentIndex', 'accountResults', 'runId', 'songIndex', 'step', 'verifiedSession']);
   if (!expected || !sameTask(data, expected) || data.step === 'ACCOUNT_ROLLOVER') return;
   await closePaymentPopups();
 
@@ -147,7 +150,7 @@ async function performAccountRollover(reason, isError, expected) {
   }
 
   const nextIndex = (data.currentIndex || 0) + 1;
-  const logoutUrl = "https://www.genie.co.kr/member/logout?page_rfr=" + encodeURIComponent("https://www.genie.co.kr/");
+  const logoutUrl = "https://www.genie.co.kr/auth/signOut?rfr=" + encodeURIComponent("https://www.genie.co.kr/");
 
   if (nextIndex >= accounts.length) {
     await appendLog('SUCCESS', `✅ 전체 계정(${accounts.length}개) 작업이 모두 완료되었습니다!`);
@@ -169,6 +172,7 @@ async function performAccountRollover(reason, isError, expected) {
   await chrome.storage.local.set({
     currentIndex: nextIndex,
     step: 'NEXT_ACCOUNT_LOGIN',
+    previousSession: data.verifiedSession || null, verifiedSession: null, authSequence: null,
     albumIndex: 0,
     songIndex: 0,
     waitRetry: 0
@@ -255,9 +259,10 @@ async function claimTaskAction(action, expected) {
   };
   if (!expected || !allowedSteps[action]) return false;
   return withStateLock(async () => {
-    const current = await chrome.storage.local.get(['isRunning', 'runId', 'currentIndex', 'songIndex', 'albumIndex', 'step', 'actionClaims']);
+    const current = await chrome.storage.local.get(['isRunning', 'runId', 'currentIndex', 'songIndex', 'albumIndex', 'step', 'actionClaims', 'accounts', 'verifiedSession']);
     if (!sameTask(current, expected) || (current.albumIndex || 0) !== (expected.albumIndex || 0) ||
         !allowedSteps[action].includes(current.step)) return false;
+    if (['ALBUM_LIKE','SONG_LIKE','PAY_SONG','PAY_FINAL'].includes(action) && !await assertVerifiedSession(current)) return false;
     const key = [current.runId || 'legacy', current.currentIndex || 0, current.albumIndex || 0, current.songIndex || 0, action].join(':');
     const claims = current.actionClaims || {}, previous = claims[key];
     const cooldown = action === 'LOGIN' ? 10000 : action === 'OPEN_LOGIN' ? 7000 : Infinity;
@@ -268,5 +273,105 @@ async function claimTaskAction(action, expected) {
     if (action === 'PAY_FINAL') Object.assign(updates, { step: 'WAIT_DOWNLOAD_STREAM', waitRetry: 0 });
     await chrome.storage.local.set(updates);
     return true;
+  });
+}
+
+// 서버가 렌더링한 회원번호와 로그인 여부만 사용합니다. 입력칸/닉네임은 확인 근거로 사용하지 않습니다.
+function parseSessionSnapshot(html) {
+  const members = [...String(html).matchAll(/\biMemUno\s*=\s*["']([^"']*)["']/g)].map(m => m[1]);
+  const flags = [...String(html).matchAll(/\bisLogin\s*=\s*StringUtils\.stringToBoolean\(\s*["'](true|false)["']\.toLowerCase\(\)\s*\)/g)].map(m => m[1]);
+  const ids = [...new Set(members)], states = [...new Set(flags)];
+  if (ids.length !== 1 || states.length !== 1) throw new Error('서버 로그인 상태를 판독할 수 없습니다');
+  if (states[0] === 'false' && ids[0] === '') return {loggedIn:false, memberNo:''};
+  if (states[0] === 'true' && /^\d+$/.test(ids[0])) return {loggedIn:true, memberNo:ids[0]};
+  throw new Error('서버 로그인 상태와 회원번호가 일치하지 않습니다');
+}
+async function readServerSession() {
+  const controller = new AbortController(), timer = setTimeout(() => controller.abort(), 10000);
+  try {
+    const response = await window.fetch('https://www.genie.co.kr/?genie_session_check=' + Date.now(), {credentials:'include', cache:'no-store', signal:controller.signal});
+    if (!response.ok) throw new Error('로그인 확인 응답 오류 (' + response.status + ')');
+    return parseSessionSnapshot(await response.text());
+  } finally { clearTimeout(timer); }
+}
+function verifiedFor(data) {
+  const v=data.verifiedSession;
+  return Boolean(v && v.runId===data.runId && v.index===(data.currentIndex||0) && v.account===data.accounts?.[data.currentIndex||0]?.id && v.memberNo);
+}
+async function stopAccountAuth(message,expected) {
+  if(expected){const now=await chrome.storage.local.get(['isRunning','runId','currentIndex','songIndex']);if(!sameTask(now,expected))return {ok:false};}
+  await chrome.storage.local.set({isRunning:false, verifiedSession:null});
+  await appendLog('ERROR', '계정 확인 실패: ' + message + ' → 작업 중단');
+  return {ok:false,error:message};
+}
+async function assertVerifiedSession(data) {
+  if (!verifiedFor(data)) { await stopAccountAuth('현재 계정의 로그인 확인 기록이 없습니다',data); return false; }
+  try {
+    const session=await readServerSession();
+    const now=await chrome.storage.local.get(['isRunning','runId','currentIndex','songIndex','step']);
+    if(!sameTask(now,data)||now.step!==data.step)return false;
+    if (session.loggedIn && session.memberNo===data.verifiedSession.memberNo) return true;
+    await stopAccountAuth('확인한 계정의 로그인 세션이 변경되었거나 로그아웃되었습니다',data);
+  } catch(error) { await stopAccountAuth(error.message,data); }
+  return false;
+}
+const authLogoutUrl='https://www.genie.co.kr/auth/signOut?rfr='+encodeURIComponent('https://www.genie.co.kr/');
+const authLoginUrl='https://www.genie.co.kr/member/popLogin?page_rfr='+encodeURIComponent('https://www.genie.co.kr/');
+async function accountAuthRequest(msg,sender) {
+  return withStateLock(async()=>{
+    const data=await chrome.storage.local.get(['isRunning','runId','currentIndex','songIndex','accounts','albums','songs','step','mainTabId','verifiedSession','previousSession','authSequence','accountMemberBindings']);
+    if (msg.action==='AUTH_OWNER') return {ok:sender.frameId===0 && sender.tab?.id===data.mainTabId};
+    if (!msg.expected || !sameTask(data,msg.expected)) return {ok:false};
+    if (msg.action==='AUTH_ASSERT') return {ok:await assertVerifiedSession(data)};
+    if (sender.frameId!==0 || sender.tab?.id!==data.mainTabId) return {ok:false};
+    const probe=async()=>{const session=await readServerSession();const now=await chrome.storage.local.get(['isRunning','runId','currentIndex','songIndex','step']);if(!sameTask(now,data)||now.step!==data.step){const error=new Error('stale auth');error.stale=true;throw error;}return session;};
+    const account=data.accounts?.[data.currentIndex||0]; if(!account)return stopAccountAuth('대상 계정이 없습니다',data);
+    try {
+      if(msg.action==='AUTH_BEGIN') {
+        if(!['CHECK_OR_LOGIN','NEXT_ACCOUNT_LOGIN','IDLE'].includes(data.step))return {ok:false};
+        const session=await probe();
+        const previous=data.verifiedSession||data.previousSession;
+        const sequence={runId:data.runId,index:data.currentIndex||0,account:account.id,phase:'LOGOUT',startedAt:Date.now(),previousMember:session.memberNo||previous?.memberNo||'',previousAccount:previous?.account||'',logoutAttempts:1};
+        await chrome.storage.local.set({authSequence:sequence,verifiedSession:null,step:'AUTH_LOGOUT',albumIndex:0,songIndex:0,waitRetry:0});
+        await appendLog('INFO','이전 로그인 세션 로그아웃 요청 → 서버 상태 확인 대기');
+        return {ok:true,url:authLogoutUrl};
+      }
+      const seq=data.authSequence;
+      if(!seq || seq.runId!==data.runId || seq.index!==(data.currentIndex||0) || seq.account!==account.id)return stopAccountAuth('로그인 순서 정보가 일치하지 않습니다',data);
+      if(msg.action==='AUTH_FAIL')return stopAccountAuth('지니 로그인 화면에서 오류가 확인되었습니다',data);
+      if(msg.action==='AUTH_LOGOUT_CHECK' && data.step==='AUTH_LOGOUT' && seq.phase==='LOGOUT') {
+        const session=await probe();
+        if(session.loggedIn) {
+          if(Date.now()-seq.startedAt>30000)return stopAccountAuth('이전 계정의 로그아웃이 확인되지 않았습니다',data);
+          if(Date.now()-seq.startedAt>5000 && seq.logoutAttempts<2){await chrome.storage.local.set({authSequence:{...seq,logoutAttempts:2}});return {ok:true,url:authLogoutUrl};}
+          return {ok:true,waiting:true};
+        }
+        await chrome.storage.local.set({step:'AUTH_FORM',authSequence:{...seq,phase:'FORM',logoutConfirmedAt:Date.now()}});
+        await appendLog('SUCCESS','서버 로그아웃 확인 완료 → 대상 계정 로그인 준비');
+        return {ok:true,url:authLoginUrl};
+      }
+      if(msg.action==='AUTH_SUBMIT' && data.step==='AUTH_FORM' && seq.phase==='FORM') {
+        if(Date.now()-seq.logoutConfirmedAt>60000)return stopAccountAuth('로그인 준비 시간이 초과되었습니다',data);
+        if((await probe()).loggedIn)return stopAccountAuth('대상 계정 로그인 전에 다른 로그인 세션이 나타났습니다',data);
+        await chrome.storage.local.set({step:'AUTH_WAIT',authSequence:{...seq,phase:'WAIT',submittedAt:Date.now()}});
+        await appendLog('INFO','로그아웃 확인 후 대상 계정 로그인 1회 제출');
+        return {ok:true};
+      }
+      if(msg.action==='AUTH_LOGIN_CHECK' && data.step==='AUTH_WAIT' && seq.phase==='WAIT') {
+        const session=await probe();
+        if(!session.loggedIn){if(Date.now()-seq.submittedAt>30000)return stopAccountAuth('대상 계정 로그인 성공이 확인되지 않았습니다',data);return {ok:true,waiting:true};}
+        if(seq.previousAccount && seq.previousAccount!==account.id && seq.previousMember===session.memberNo)return stopAccountAuth('이전 계정과 동일한 회원 세션이 다시 확인되었습니다',data);
+        const bindings=data.accountMemberBindings||{};
+        if(bindings[account.id] && bindings[account.id]!==session.memberNo)return stopAccountAuth('대상 계정에 이전에 확인된 회원번호와 다릅니다',data);
+        if(Object.entries(bindings).some(([id,member])=>id!==account.id && member===session.memberNo))return stopAccountAuth('다른 계정에 확인된 회원번호와 중복됩니다',data);
+        bindings[account.id]=session.memberNo;
+        const step=data.albums?.length?'ALBUM_LIKE':'SONG_LIKE';
+        const url=data.albums?.length?'https://www.genie.co.kr/detail/albumInfo?axnm='+encodeURIComponent(data.albums[0]):'https://www.genie.co.kr/detail/songInfo?xgnm='+encodeURIComponent(data.songs[0]);
+        await chrome.storage.local.set({verifiedSession:{runId:data.runId,index:data.currentIndex||0,account:account.id,memberNo:session.memberNo},accountMemberBindings:bindings,step,albumIndex:0,songIndex:0,waitRetry:0,authSequence:{...seq,phase:'VERIFIED'}});
+        await appendLog('SUCCESS','대상 계정 로그인 흐름 및 서버 회원 세션 확인 완료 → 작업 진행');
+        return {ok:true,url};
+      }
+      return {ok:false};
+    } catch(error) { if(error.stale)return {ok:false};return stopAccountAuth(error.name==='AbortError'?'서버 로그인 확인 시간 초과':error.message,data); }
   });
 }

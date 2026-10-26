@@ -43,7 +43,7 @@ function getNextStageUrl(nextStep, data) {
   }
   return {
     step: 'NEXT_ACCOUNT_LOGIN',
-    url: "https://www.genie.co.kr/member/logout?page_rfr=" + encodeURIComponent("https://www.genie.co.kr/")
+    url: "https://www.genie.co.kr/auth/signOut?rfr=" + encodeURIComponent("https://www.genie.co.kr/")
   };
 }
 
@@ -297,7 +297,7 @@ async function createFloatingPanel() {
     finally { startBtn.disabled = false; }
     if (!loaded) return;
 
-    const data = await chrome.storage.local.get(['accounts', 'step', 'currentIndex', 'albumIndex', 'songIndex', 'albums', 'songs']);
+    const data = await chrome.storage.local.get(['accounts', 'step', 'currentIndex', 'albumIndex', 'songIndex', 'albums', 'songs', 'verifiedSession', 'previousSession']);
     if (!data.accounts || data.accounts.length === 0) {
       await saveLog('⚠️ 계정 파일을 먼저 등록해주세요!', 'ERROR');
       return;
@@ -320,10 +320,12 @@ async function createFloatingPanel() {
       runId: crypto.randomUUID(),
       actionClaims: {},
       downloadWaitStartedAt: 0,
-      step,
+      step: 'CHECK_OR_LOGIN',
+      previousSession: data.verifiedSession || data.previousSession || null,
+      verifiedSession: null, authSequence: null,
       currentIndex: cIdx,
-      albumIndex: albIdx,
-      songIndex: sIdx,
+      albumIndex: 0,
+      songIndex: 0,
       waitRetry: 0
     });
 
@@ -338,7 +340,7 @@ async function createFloatingPanel() {
       targetUrl = getUrl('song', data.songs[sIdx] || data.songs[0]);
     }
 
-    navigateTask(targetUrl);
+    navigateTask('https://www.genie.co.kr/');
   };
 
   document.getElementById('btn-stop').onclick = async () => {
@@ -566,6 +568,7 @@ function actionable(el) {
 async function handlePayment(data) {
   if (!['SONG_DOWNLOAD', 'PAY_POPUP_STEP1', 'WAIT_DOWNLOAD_STREAM'].includes(data.step)) return false;
   if (data.step === 'WAIT_DOWNLOAD_STREAM') return false;
+  if (!(await authCommand('AUTH_ASSERT',data))?.ok) return true;
   const cash = document.querySelector('input#name-genie[name="selectPay"][value="8"], #name-genie');
   const agree = document.querySelector('input#name-agree');
   const purchase = document.querySelector('input#name-payment');
@@ -625,7 +628,7 @@ async function processTask() {
     createFloatingPanel();
 
     const data = await chrome.storage.local.get([
-      'accounts', 'currentIndex', 'albums', 'songs', 'albumIndex', 'songIndex', 'isRunning', 'step', 'waitRetry', 'runId', 'downloadWaitStartedAt'
+      'accounts', 'currentIndex', 'albums', 'songs', 'albumIndex', 'songIndex', 'isRunning', 'step', 'waitRetry', 'runId', 'downloadWaitStartedAt', 'authSequence'
     ]);
     if (!data.isRunning || !data.accounts || data.accounts.length === 0) {
       isStepRunning = false;
@@ -644,124 +647,11 @@ async function processTask() {
     const currentAccount = accounts[currentIndex];
     const currentUrl = window.location.href;
 
+    if (await handleAccountAuthentication(data)) return;
     if (await handlePayment(data)) return;
-
-    // 비밀번호 변경 캠페인(myInfoPwdChangeMsg) 추가 
-    if (currentUrl.includes('popLoginSuccess') || currentUrl.toLowerCase().includes('loginsuccess') || currentUrl.includes('myInfoPwdChangeMsg')) {
-      const next = getNextStageUrl('ALBUM_LIKE', data);
-      await chrome.storage.local.set({ step: next.step, waitRetry: 0 });
-      navigateTask(next.url, true);
-      isStepRunning = false;
-      return;
-    }
-
-    const idInput =
-      document.querySelector('#gnb_uxd') ||
-      document.querySelector('#gnb_uxd_id') ||
-      document.querySelector('#uxd_id') ||
-      document.querySelector('input[name="gnb_uxd"]');
-    const pwInput =
-      document.querySelector('#gnb_uxx') ||
-      document.querySelector('#gnb_uxd_pw') ||
-      document.querySelector('#uxd_pw') ||
-      document.querySelector('input[name="gnb_uxx"]');
-
-    if (currentUrl.includes('/member/popLogin') || currentUrl.includes('/member/login') || (idInput && pwInput && idInput.offsetParent !== null)) {
-      if (document.body && (document.body.innerText.includes('일치하지 않습니다') || document.body.innerText.includes('다시 확인해주세요'))) {
-        if (!await claimTaskAction('LOGIN_FAILURE', data)) return;
-        await saveLog(`❌ ${currentAccount.id} - 로그인 실패(아이디/비번 오류 스킵)`, 'ERROR');
-        await updateStepResult(currentAccount.id, 'album', 'x');
-        await updateStepResult(currentAccount.id, 'song', 'x');
-        await updateStepResult(currentAccount.id, 'down', 'x');
-        const nextStage = getNextStageUrl('ALBUM_LIKE', data);
-        await chrome.storage.local.set({
-          currentIndex: currentIndex + 1,
-          step: 'CHECK_OR_LOGIN',
-          albumIndex: 0,
-          songIndex: 0
-        });
-        navigateTask("https://www.genie.co.kr/member/popLogin?page_rfr=" + encodeURIComponent(nextStage.url));
-        isStepRunning = false;
-        return;
-      }
-
-      if (idInput && pwInput) {
-        if (!await claimTaskAction('LOGIN', data)) return;
-        setInputValue(idInput, currentAccount.id);
-        setInputValue(pwInput, currentAccount.pw);
-
-        const nextStage = getNextStageUrl('ALBUM_LIKE', data);
-        if (!step || step === 'CHECK_OR_LOGIN' || step === 'IDLE' || step === 'NEXT_ACCOUNT_LOGIN') {
-          await chrome.storage.local.set({
-            step: nextStage.step,
-            albumIndex: 0,
-            songIndex: 0,
-            waitRetry: 0
-          });
-        }
-
-        await saveLog(`🔑 로그인 시도 중 (${currentAccount.id})`, 'INFO');
-
-        // 딜레이 0.3초 증가 (600 -> 900)
-        await taskDelay(900);
-        if (!await isTaskCurrent(data)) return;
-        {
-          const loginBtn =
-            document.querySelector('input.btn-submit[value="로그인"]') ||
-            document.querySelector('input.btn-submit') ||
-            document.querySelector('input[type="submit"]') ||
-            document.querySelector('button[type="submit"]') ||
-            document.querySelector('.btn-login');
-          if (loginBtn) {
-            loginBtn.click();
-          } else {
-            callPageFunction('loginID');
-          }
-        }
-        isStepRunning = false;
-        return;
-      }
-    }
-
-    if (window !== window.top) {
-      isStepRunning = false;
-      return;
-    }
-
-    if (step === 'CHECK_OR_LOGIN') {
-      if (isUserLoggedIn()) {
-        const next = getNextStageUrl('ALBUM_LIKE', data);
-        await chrome.storage.local.set({ step: next.step, waitRetry: 0 });
-        navigateTask(next.url);
-        isStepRunning = false;
-        return;
-      }
-
-      if (!await claimTaskAction('OPEN_LOGIN', data)) return;
-      const genieLoginBtn = document.querySelector('a.btn-login[onclick*="loginPopup"]');
-      const openLayerBtn = Array.from(document.querySelectorAll('button.btn, a.btn')).find(el =>
-        el.textContent.includes('로그인/회원가입')
-      );
-
-      if (genieLoginBtn && genieLoginBtn.offsetParent !== null) {
-        genieLoginBtn.click();
-      } else if (openLayerBtn) {
-        openLayerBtn.click();
-        // 딜레이 0.3초 증가 (400 -> 700)
-        await taskDelay(700);
-        if (!await isTaskCurrent(data)) return;
-        {
-          const gBtn = document.querySelector('a.btn-login[onclick*="loginPopup"]');
-          if (gBtn) gBtn.click();
-          else callPageFunction('loginPopup');
-        }
-      } else {
-        const next = getNextStageUrl('ALBUM_LIKE', data);
-        navigateTask("https://www.genie.co.kr/member/popLogin?page_rfr=" + encodeURIComponent(next.url));
-      }
-      isStepRunning = false;
-      return;
-    }
+    if (window !== window.top) return;
+    if (!(await chrome.runtime.sendMessage({action:'AUTH_OWNER'}))?.ok) return;
+    if (!(await authCommand('AUTH_ASSERT',data))?.ok) return;
 
     // 앨범 좋아요 단계
     if (step === 'ALBUM_LIKE') {
@@ -850,18 +740,7 @@ async function processTask() {
       return;
     }
 
-    if (step === 'NEXT_ACCOUNT_LOGIN') {
-      const firstStage = getNextStageUrl('ALBUM_LIKE', data);
-      await chrome.storage.local.set({
-        step: firstStage.step,
-        albumIndex: 0,
-        songIndex: 0,
-        waitRetry: 0
-      });
-      navigateTask("https://www.genie.co.kr/member/popLogin?page_rfr=" + encodeURIComponent(firstStage.url));
-      isStepRunning = false;
-      return;
-    }
+
   } catch (err) {
     await saveLog(`❌ 오류 발생: ${err.message}`, 'ERROR');
   } finally {
@@ -871,3 +750,33 @@ async function processTask() {
 
 createFloatingPanel();
 setInterval(processTask, 1000);
+async function authCommand(action,data) {
+  return chrome.runtime.sendMessage({action,expected:{runId:data.runId,currentIndex:data.currentIndex||0,songIndex:data.songIndex||0}});
+}
+async function handleAccountAuthentication(data) {
+  if (!['CHECK_OR_LOGIN','NEXT_ACCOUNT_LOGIN','IDLE','AUTH_LOGOUT','AUTH_FORM','AUTH_WAIT'].includes(data.step)) return false;
+  if(window!==window.top)return true;
+  if(!(await chrome.runtime.sendMessage({action:'AUTH_OWNER'}))?.ok)return true;
+  let reply;
+  if(['CHECK_OR_LOGIN','NEXT_ACCOUNT_LOGIN','IDLE'].includes(data.step)) reply=await authCommand('AUTH_BEGIN',data);
+  else if(data.step==='AUTH_LOGOUT')reply=await authCommand('AUTH_LOGOUT_CHECK',data);
+  else if(data.step==='AUTH_FORM') {
+    const pick=selector=>Array.from(document.querySelectorAll(selector)).find(actionable);
+    const id=pick('#gnb_uxd,#gnb_uxd_id,#uxd_id,input[name="gnb_uxd"]');
+    const pw=pick('#gnb_uxx,#gnb_uxd_pw,#uxd_pw,input[name="gnb_uxx"]');
+    if(!id||!pw){if(Date.now()-(data.authSequence?.logoutConfirmedAt||0)>30000)await authCommand('AUTH_FAIL',data);return true;}
+    setInputValue(id,data.accounts[data.currentIndex||0].id);setInputValue(pw,data.accounts[data.currentIndex||0].pw);
+    await taskDelay(900);
+    if(!await isTaskCurrent(data,['AUTH_FORM']))return true;
+    reply=await authCommand('AUTH_SUBMIT',data);
+    if(!reply?.ok||!await isTaskCurrent(data,['AUTH_WAIT']))return true;
+    const button=pick('input.btn-submit[value="로그인"],input.btn-submit,input[type="submit"],button[type="submit"],.btn-login,a[onclick*="loginID"]');
+    if(button)button.click();else callPageFunction('loginID');
+    return true;
+  } else {
+    if(Date.now()-(data.authSequence?.submittedAt||0)>1500 && /일치하지 않습니다|다시 확인해주세요/.test(document.body?.innerText||''))reply=await authCommand('AUTH_FAIL',data);
+    else reply=await authCommand('AUTH_LOGIN_CHECK',data);
+  }
+  if(reply?.ok&&reply.url&&await isTaskCurrent(data))navigateTask(reply.url,true);
+  return true;
+}
