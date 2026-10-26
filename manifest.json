@@ -1,44 +1,16 @@
 {
   "manifest_version": 3,
-  "name": "지니 다중 계정 자동화 (앨범+곡 좋아요 & 다운)",
-  "version": "8.5.2",
-  "description": "지니뮤직 다중 계정 로그인, 앨범/곡 좋아요, 5단계 개별곡 결제 및 다운로드 즉시 계정 전환 엔진",
-  "permissions": [
-    "activeTab",
-    "scripting",
-    "storage",
-    "tabs",
-    "downloads"
-  ],
-  "host_permissions": [
-    "*://*.genie.co.kr/*",
-    "https://docs.google.com/*",
-    "https://*.googleusercontent.com/*"
-  ],
-  "action": {
-    "default_icon": "icon.png"
-  },
-  "icons": {
-    "16": "icon.png",
-    "48": "icon.png",
-    "128": "icon.png"
-  },
-  "background": {
-    "service_worker": "background.js"
-  },
+  "name": "지니 다운 도우미 자동 업데이트 실행기",
+  "version": "9.0.0",
+  "minimum_chrome_version": "120",
+  "description": "최신 작업 코드를 불러오는 PC·Android 공용 실행기. 결제·다운로드와 계정 전환 지원.",
+  "permissions": ["storage", "tabs", "downloads", "userScripts"],
+  "host_permissions": ["*://*.genie.co.kr/*", "https://docs.google.com/*", "https://*.googleusercontent.com/*", "https://raw.githubusercontent.com/*"],
+  "action": {"default_icon": "icon.png"},
+  "icons": {"16": "icon.png", "48": "icon.png", "128": "icon.png"},
+  "background": {"service_worker": "background.js"},
   "content_scripts": [
-    {
-      "matches": ["*://*.genie.co.kr/*"],
-      "js": ["alert_blocker.js"],
-      "run_at": "document_start",
-      "world": "MAIN",
-      "all_frames": true
-    },
-    {
-      "matches": ["*://*.genie.co.kr/*"],
-      "js": ["content.js"],
-      "run_at": "document_idle",
-      "all_frames": true
-    }
+    {"matches": ["*://*.genie.co.kr/*"], "js": ["alert_blocker.js"], "run_at": "document_start", "world": "MAIN", "all_frames": true},
+    {"matches": ["*://*.genie.co.kr/*"], "js": ["launcher.js"], "run_at": "document_idle", "all_frames": true}
   ]
 }

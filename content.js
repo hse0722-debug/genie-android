@@ -168,7 +168,7 @@ async function createFloatingPanel() {
 
   panel.innerHTML = `
     <div id="dash-header" style="background:#2c3e50; color:white; padding:10px 14px; cursor:move; display:flex; justify-content:space-between; align-items:center; border-radius:7px 7px 0 0; user-select:none;">
-      <span style="font-weight:bold; font-size:13px;">🎵 지니 다운 도우미 [포레스텔라음원총공팀 제작]</span>
+      <span style="font-weight:bold; font-size:13px;">🎵 지니 다운 도우미 ${globalThis.__genieRuntimeVersion || "9.0.0"} [포레스텔라음원총공팀 제작]</span>
       <button id="btn-close-dash" style="background:#e74c3c; color:white; border:none; padding:3px 8px; border-radius:4px; cursor:pointer; font-weight:bold; font-size:11px;">숨기기 _</button>
     </div>
 

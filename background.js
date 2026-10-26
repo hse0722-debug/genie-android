@@ -1,267 +1,230 @@
-// 확장 프로그램 아이콘 클릭 시 지니 탭 활성화 및 리모컨 표시 (원본 기능 유지)
+'use strict';
+const BASE = 'https://raw.githubusercontent.com/hse0722-debug/genie-android/main/';
+const PRIVATE = '_genieLoader_';
+const clients = new Set();
+const requests = new Map();
+let fetchInFlight, setupInFlight, pumping = false, kernelQueue = Promise.resolve();
+const lock = fn => { const result = kernelQueue.then(fn); kernelQueue = result.catch(() => {}); return result; };
+const wait = ms => new Promise(resolve => setTimeout(resolve, ms));
+const genieUrl = url => { try { const u = new URL(url); return ['http:', 'https:'].includes(u.protocol) && (u.hostname === 'genie.co.kr' || u.hostname.endsWith('.genie.co.kr')); } catch { return false; } };
+const enginePage = sender => sender.frameId === 0 && genieUrl(sender.url);
+function requireSender(sender) { if (!sender.tab?.id || !sender.documentId || !genieUrl(sender.url)) throw new Error('지니 페이지에서만 실행할 수 있습니다.'); }
+function appObject(obj) { return Object.fromEntries(Object.entries(obj || {}).filter(([key]) => !key.startsWith(PRIVATE))); }
+async function readApp(keys) {
+  if (Array.isArray(keys)) keys = keys.filter(key => typeof key === 'string' && !key.startsWith(PRIVATE));
+  else if (typeof keys === 'string' && keys.startsWith(PRIVATE)) return {};
+  else if (keys && typeof keys === 'object') keys = appObject(keys);
+  return appObject(await chrome.storage.local.get(keys));
+}
+async function fetchText(url, timeout = 15000) {
+  const controller = new AbortController(), timer = setTimeout(() => controller.abort(), timeout);
+  try { const r = await fetch(url, { cache: 'no-store', credentials: 'omit', signal: controller.signal }); return { ok: r.ok, status: r.status, body: await r.text() }; }
+  finally { clearTimeout(timer); }
+}
+async function digest(text) { return Array.from(new Uint8Array(await crypto.subtle.digest('SHA-256', new TextEncoder().encode(text)))).map(v => v.toString(16).padStart(2, '0')).join(''); }
+async function latestBundle() {
+  if (fetchInFlight) return fetchInFlight;
+  fetchInFlight = (async () => {
+    const response = await fetchText(BASE + 'release.json?refresh=' + Date.now() + '-' + crypto.randomUUID());
+    if (!response.ok) throw new Error('최신 버전 조회 실패: HTTP ' + response.status);
+    const m = JSON.parse(response.body);
+    if (m.schema !== 1 || m.loaderApi !== 1 || !/^\d+\.\d+\.\d+$/.test(m.version)) throw new Error('실행기와 호환되지 않는 배포 정보입니다.');
+    const readAsset = async (role, prefix) => {
+      const entry = m[role];
+      if (!entry || entry.file !== prefix + m.version + '.js' || !/^[a-f0-9]{64}$/.test(entry.sha256)) throw new Error('배포 파일 정보가 올바르지 않습니다.');
+      const asset = await fetchText(BASE + entry.file);
+      if (!asset.ok || asset.body.length > 1500000) throw new Error('작업 코드 다운로드 실패: ' + role);
+      if (await digest(asset.body) !== entry.sha256) throw new Error('작업 코드 검증 실패: ' + role);
+      return asset.body;
+    };
+    const [content, engine] = await Promise.all([readAsset('content', 'genie-content-'), readAsset('engine', 'genie-engine-')]);
+    return { id: m.version + ':' + m.content.sha256 + ':' + m.engine.sha256, version: m.version, content, engine };
+  })();
+  try { return await fetchInFlight; } finally { fetchInFlight = null; }
+}
+async function bundleForDocument(sender) {
+  requireSender(sender);
+  const state = await chrome.storage.local.get(['isRunning', PRIVATE + 'runBundle']);
+  let bundle;
+  if (state.isRunning) {
+    bundle = state[PRIVATE + 'runBundle'];
+    if (!bundle) {
+      await chrome.storage.local.set({ isRunning: false });
+      throw new Error('새 실행기 설치가 완료되었습니다. 페이지를 한 번 새로고침한 뒤 시작해주세요.');
+    }
+  } else bundle = await latestBundle();
+  await lock(async () => {
+    const saved = await chrome.storage.local.get([PRIVATE + 'bundles', PRIVATE + 'documents']);
+    const bundles = saved[PRIVATE + 'bundles'] || {}, docs = saved[PRIVATE + 'documents'] || {};
+    bundles[bundle.id] = bundle; docs[sender.documentId] = { bundleId: bundle.id, tabId: sender.tab.id, frameId: sender.frameId };
+    const keep = new Set([bundle.id, state[PRIVATE + 'runBundle']?.id]);
+    for (const key of Object.keys(bundles).slice(0, -5)) if (!keep.has(key)) delete bundles[key];
+    const docKeys = Object.keys(docs); for (const key of docKeys.slice(0, -300)) delete docs[key];
+    await chrome.storage.local.set({ [PRIVATE + 'bundles']: bundles, [PRIVATE + 'documents']: docs });
+  });
+  return bundle;
+}
+async function validateContext(sender, bundleId) {
+  requireSender(sender);
+  const saved = await chrome.storage.local.get([PRIVATE + 'documents', PRIVATE + 'bundles']);
+  const doc = saved[PRIVATE + 'documents']?.[sender.documentId];
+  const bundle = saved[PRIVATE + 'bundles']?.[bundleId];
+  if (!doc || doc.bundleId !== bundleId || !bundle || doc.tabId !== sender.tab.id) throw new Error('실행 연결이 만료되었습니다. 페이지를 새로고침해주세요.');
+  return bundle;
+}
+async function ensureRuntime() {
+  if (setupInFlight) return setupInFlight;
+  setupInFlight = (async () => {
+    if (!chrome.userScripts?.configureWorld || !chrome.runtime.onUserScriptMessage) throw new Error('이 브라우저에서 사용자 스크립트 API를 사용할 수 없습니다. 확장 세부정보의 사용자 스크립트 허용을 확인해주세요.');
+    await chrome.userScripts.configureWorld({ messaging: true, csp: "script-src 'self' 'unsafe-eval'; object-src 'none'" });
+    const installed = await chrome.userScripts.getScripts({ ids: ['genie-runtime-v1'] });
+    if (!installed.length) await chrome.userScripts.register([{ id: 'genie-runtime-v1', matches: ['*://*.genie.co.kr/*'], allFrames: true, runAt: 'document_idle', world: 'USER_SCRIPT', js: [{ file: 'user-runtime.js' }] }]);
+  })();
+  try { return await setupInFlight; } finally { setupInFlight = null; }
+}
+async function bootstrap(sender) {
+  requireSender(sender); await ensureRuntime();
+  if (chrome.userScripts.execute) {
+    const results = await chrome.userScripts.execute({ target: { tabId: sender.tab.id, documentIds: [sender.documentId] }, world: 'USER_SCRIPT', js: [{ file: 'user-runtime.js' }] });
+    const failure = results?.find(result => result.error); if (failure) throw new Error(String(failure.error));
+    return { ready: true };
+  }
+  return { reloadRequired: true };
+}
+async function controller() {
+  const state = await chrome.storage.local.get(['mainTabId', 'isRunning', PRIVATE + 'runBundle']);
+  const candidates = [...clients].filter(c => c.ready && c.engine && (!state.isRunning || c.bundleId === state[PRIVATE + 'runBundle']?.id));
+  const selected = candidates.find(c => c.sender.tab.id === state.mainTabId);
+  return selected || (!state.isRunning ? candidates.at(-1) : null);
+}
+async function requestEngine(type, payload, preferred) {
+  let target = preferred;
+  for (let attempt = 0; !target && attempt < 60; attempt++) { target = await controller(); if (!target) await wait(200); }
+  if (!target) throw new Error('도우미 메인 탭을 열고 새로고침해주세요.');
+  const id = crypto.randomUUID();
+  return new Promise((resolve, reject) => {
+    const timer = setTimeout(() => { requests.delete(id); reject(new Error('도우미 응답 시간이 초과되었습니다.')); }, 35000);
+    requests.set(id, { resolve, reject, timer, target });
+    try { target.port.postMessage({ type, id, payload }); } catch (error) { clearTimeout(timer); requests.delete(id); reject(error); }
+  });
+}
+async function rpc(message, sender) {
+  const bundle = await validateContext(sender, message.bundleId), args = message.args || [];
+  const active = await chrome.storage.local.get(['isRunning', PRIVATE + 'runBundle']);
+  if (active.isRunning && active[PRIVATE + 'runBundle']?.id !== bundle.id &&
+      !(message.method === 'STORAGE_SET' && args[0]?.isRunning === false)) {
+    throw new Error('다른 버전으로 작업이 시작되었습니다. 이 페이지를 새로고침해주세요.');
+  }
+  switch (message.method) {
+    case 'STORAGE_GET': return readApp(args[0]);
+    case 'STORAGE_SET': {
+      const values = appObject(args[0]);
+      if (values.isRunning === true && values.runId) {
+        if (!enginePage(sender)) throw new Error('메인 지니 페이지에서 시작해주세요.');
+        await lock(() => chrome.storage.local.set({ ...values, mainTabId: sender.tab.id, [PRIVATE + 'runBundle']: bundle }));
+      } else await chrome.storage.local.set(values);
+      return null;
+    }
+    case 'STORAGE_CLEAR': return lock(async () => {
+      const all = await chrome.storage.local.get(null);
+      await chrome.storage.local.remove(Object.keys(all).filter(k => !k.startsWith(PRIVATE)));
+      await chrome.storage.local.set({ [PRIVATE + 'events']: [], [PRIVATE + 'runBundle']: null });
+      return null;
+    });
+    case 'RUNTIME_SEND': {
+      const msg = args[0];
+      if (msg?.action === 'REGISTER_MAIN_TAB') {
+        if (enginePage(sender)) {
+          const current = await chrome.storage.local.get(['mainTabId', 'isRunning']);
+          if (!current.isRunning && !current.mainTabId) await chrome.storage.local.set({ mainTabId: sender.tab.id });
+        }
+        return { status: 'ok' };
+      }
+      return requestEngine('BUSINESS_REQUEST', { message: msg, sender: { tab: { id: sender.tab.id }, frameId: sender.frameId, url: sender.url } });
+    }
+    case 'TABS_QUERY': return chrome.tabs.query({ url: '*://*.genie.co.kr/*' });
+    case 'TABS_UPDATE': {
+      const tab = await chrome.tabs.get(args[0]); if (!genieUrl(tab.url)) throw new Error('지니 탭만 변경할 수 있습니다.');
+      if (args[1]?.url && !genieUrl(args[1].url)) throw new Error('지니 외부로 이동할 수 없습니다.');
+      return chrome.tabs.update(args[0], { ...(args[1]?.url ? { url: args[1].url } : {}), ...(typeof args[1]?.active === 'boolean' ? { active: args[1].active } : {}) });
+    }
+    case 'TABS_REMOVE': { const tab = await chrome.tabs.get(args[0]); if (genieUrl(tab.url)) await chrome.tabs.remove(args[0]); return null; }
+    case 'TABS_CREATE': { if (!genieUrl(args[0]?.url)) throw new Error('지니 주소만 열 수 있습니다.'); return chrome.tabs.create({ url: args[0].url }); }
+    case 'FETCH': {
+      const url = new URL(args[0]);
+      if (url.protocol !== 'https:' || url.hostname !== 'docs.google.com' || !url.pathname.startsWith('/spreadsheets/')) throw new Error('등록된 시트 주소만 조회할 수 있습니다.');
+      return fetchText(url.href, 10000);
+    }
+    default: throw new Error('지원되지 않는 실행기 요청입니다.');
+  }
+}
+chrome.runtime.onMessage.addListener((message, sender, respond) => {
+  if (message?.action !== 'GENIE_BOOTSTRAP') return false;
+  bootstrap(sender).then(value => respond({ ok: true, value }), error => respond({ ok: false, error: error.message })); return true;
+});
+chrome.runtime.onUserScriptMessage?.addListener((message, sender, respond) => {
+  const operation = message?.action === 'GENIE_GET_BUNDLE' ? bundleForDocument(sender) : message?.action === 'GENIE_RPC' ? rpc(message, sender) : Promise.reject(new Error('알 수 없는 실행기 요청입니다.'));
+  operation.then(value => respond({ ok: true, value }), error => respond({ ok: false, error: error.message })); return true;
+});
+chrome.runtime.onUserScriptConnect?.addListener(port => {
+  if (port.name !== 'genie-runtime-v1') return;
+  try { requireSender(port.sender); } catch { port.disconnect(); return; }
+  const client = { port, sender: port.sender, ready: false, engine: false, bundleId: null }; clients.add(client);
+  port.onMessage.addListener(message => {
+    if (message.type === 'HELLO') {
+      validateContext(client.sender, message.bundleId).then(async () => {
+        client.bundleId = message.bundleId; client.engine = Boolean(message.engine && enginePage(client.sender)); client.ready = true;
+        port.postMessage({ type: 'HELLO_OK' }); pumpEvents();
+      }).catch(error => { port.postMessage({ type: 'FATAL', error: error.message }); });
+    } else if (message.type === 'ENGINE_REPLY') {
+      const pending = requests.get(message.id); if (!pending || pending.target !== client) return;
+      requests.delete(message.id); clearTimeout(pending.timer);
+      if (message.ok) pending.resolve(message.value); else pending.reject(new Error(message.error || '작업 처리 오류'));
+    }
+  });
+  port.onDisconnect.addListener(() => {
+    clients.delete(client);
+    for (const [id, pending] of requests) if (pending.target === client) { clearTimeout(pending.timer); requests.delete(id); pending.reject(new Error('페이지 연결이 변경되었습니다.')); }
+  });
+});
+chrome.storage.onChanged.addListener((changes, area) => {
+  if (area !== 'local') return;
+  const visible = appObject(changes); if (!Object.keys(visible).length) return;
+  for (const client of clients) if (client.ready) { try { client.port.postMessage({ type: 'STORAGE_CHANGED', changes: visible, area }); } catch {} }
+});
 chrome.action.onClicked.addListener(async () => {
-  const genieTabs = await chrome.tabs.query({ url: "*://*.genie.co.kr/*" });
-  if (genieTabs.length > 0) {
-    await chrome.tabs.update(genieTabs[0].id, { active: true });
-    chrome.tabs.sendMessage(genieTabs[0].id, { action: "SHOW_REMOTE" }).catch(() => {});
-  } else {
-    await chrome.tabs.create({ url: "https://www.genie.co.kr/" });
-  }
-});
-
-// 실시간 및 파일 저장용 로그 기록 헬퍼
-async function appendLog(type, text) {
-  const data = await chrome.storage.local.get({ logs: [], accounts: [], currentIndex: 0 });
-  const now = new Date().toLocaleTimeString('ko-KR', { hour12: false });
-  const accId = data.accounts[data.currentIndex]?.id || 'System';
-  const entry = `[${now}] [${type}] (${accId}) ${text}`;
-  const updatedLogs = [...(data.logs || []), entry];
-
-  await chrome.storage.local.set({
-    logs: updatedLogs,
-    lastActionText: `${text} (${now})`
-  });
-}
-
-// content.js와 메시지 통신
-chrome.runtime.onMessage.addListener((msg, sender, sendResponse) => {
-  if (msg.action === 'CLAIM_TASK_ACTION') {
-    claimTaskAction(msg.taskAction, msg.expected).then(
-      granted => sendResponse({ granted }),
-      () => sendResponse({ granted: false })
-    );
-    return true;
-  }
-  if (msg.action === 'GET_SHEET_SEEDS') {
-    getSheetSeeds().then(
-      seeds => sendResponse({ ok: true, seeds }),
-      error => sendResponse({ ok: false, error: error.message })
-    );
-    return true;
-  }
-  if (msg.action === 'REGISTER_MAIN_TAB') {
-    if (sender.tab && sender.tab.id) {
-      chrome.storage.local.set({ mainTabId: sender.tab.id });
-    }
-  } else if (msg.action === 'FORCE_ROLLOVER') {
-    handleAccountRollover(msg.reason || '시간 초과/오류 스킵', true, msg.expected).catch(console.error);
-  }
-  sendResponse({ status: 'ok' });
-  return true;
-});
-
-// 다운로드 이벤트가 겹쳐도 한 곡의 결과와 계정 전환은 한 번만 처리합니다.
-chrome.downloads.onCreated.addListener(async (downloadItem) => {
-  const data = await withStateLock(async () => {
-    const current = await chrome.storage.local.get(['isRunning', 'step', 'songs', 'songIndex', 'accounts', 'currentIndex', 'accountResults', 'runId']);
-    if (!current.isRunning || !downloadSteps.includes(current.step)) return null;
-    const songs = current.songs || [], index = current.songIndex || 0;
-    if (index >= songs.length) return null;
-    await chrome.storage.local.set({ step: 'DOWNLOAD_RECEIVED', waitRetry: 0 });
-    return current;
-  });
-  if (!data) return;
-  const nextSongIdx = (data.songIndex || 0) + 1;
-  const currentAccount = data.accounts?.[data.currentIndex];
-  if (currentAccount) {
-    const results = data.accountResults || {};
-    if (!results[currentAccount.id]) results[currentAccount.id] = { album: '-', song: '-', down: '-' };
-    results[currentAccount.id].down = 'o';
-    await chrome.storage.local.set({ accountResults: results });
-  }
-  await appendLog('SUCCESS', '음원 다운로드 시작 감지 (' + nextSongIdx + '/' + data.songs.length + ') → 팝업 닫기');
-  await closePaymentPopups();
-  const hasNext = nextSongIdx < data.songs.length;
-  await new Promise(resolve => setTimeout(resolve, hasNext ? 2000 : 4000));
-  if (hasNext) {
-    await withStateLock(async () => {
-      const current = await chrome.storage.local.get(['isRunning', 'runId', 'currentIndex', 'songIndex', 'step']);
-      if (!sameTask(current, data) || current.step !== 'DOWNLOAD_RECEIVED') return;
-      await chrome.storage.local.set({ songIndex: nextSongIdx, step: 'SONG_LIKE', waitRetry: 0 });
-      await navigateMainTab('https://www.genie.co.kr/detail/songInfo?xgnm=' + encodeURIComponent(data.songs[nextSongIdx]));
-    });
-  } else {
-    await handleAccountRollover('다운로드 완료', false, data);
-  }
-});
-
-// 열려있는 결제 팝업창 닫기
-async function closePaymentPopups() {
+  const tabs = await chrome.tabs.query({ url: '*://*.genie.co.kr/*' });
+  if (!tabs.length) { await chrome.tabs.create({ url: 'https://www.genie.co.kr/' }); return; }
   const state = await chrome.storage.local.get(['mainTabId']);
-  const tabs = await chrome.tabs.query({ url: "*://*.genie.co.kr/*" });
-
-  for (const tab of tabs) {
-    const isPopup =
-      tab.url.includes('/buy/') ||
-      tab.url.includes('pop') ||
-      tab.url.includes('Popup');
-    if (tab.id !== state.mainTabId && isPopup) {
-      try {
-        await chrome.tabs.remove(tab.id);
-      } catch (e) {}
-    }
-  }
-}
-
-// 메인 탭 URL 이동
-async function navigateMainTab(targetUrl) {
-  const state = await chrome.storage.local.get(['mainTabId']);
-  const tabs = await chrome.tabs.query({ url: "*://*.genie.co.kr/*" });
-  let mainTabId = state.mainTabId;
-
-  if (!mainTabId && tabs.length > 0) {
-    mainTabId = tabs[0].id;
-  }
-  if (mainTabId) {
-    chrome.tabs.update(mainTabId, { url: targetUrl });
-  }
-}
-
-// 계정 전환 (로그아웃 ?page_rfr= 활용)
-async function handleAccountRollover(reason, isError, expected) {
-  return withStateLock(() => performAccountRollover(reason, isError, expected));
-}
-
-async function performAccountRollover(reason, isError, expected) {
-  const data = await chrome.storage.local.get(['isRunning', 'accounts', 'currentIndex', 'accountResults', 'runId', 'songIndex', 'step']);
-  if (!expected || !sameTask(data, expected) || data.step === 'ACCOUNT_ROLLOVER') return;
-  await chrome.storage.local.set({ step: 'ACCOUNT_ROLLOVER' });
-  await closePaymentPopups();
-
-  const accounts = data.accounts || [];
-  const currentAccount = accounts[data.currentIndex];
-
-  // 다음 계정으로 넘어갈 때 완료되지 않은('-') 항목을 'x'로 기록
-  if (currentAccount) {
-    const results = data.accountResults || {};
-    if (!results[currentAccount.id]) results[currentAccount.id] = { album: '-', song: '-', down: '-' };
-    if (results[currentAccount.id].album === '-') results[currentAccount.id].album = 'x';
-    if (results[currentAccount.id].song === '-') results[currentAccount.id].song = 'x';
-    if (results[currentAccount.id].down === '-') results[currentAccount.id].down = 'x';
-    await chrome.storage.local.set({ accountResults: results });
-  }
-
-  const nextIndex = (data.currentIndex || 0) + 1;
-  const logoutUrl = "https://www.genie.co.kr/member/logout?page_rfr=" + encodeURIComponent("https://www.genie.co.kr/");
-
-  if (nextIndex >= accounts.length) {
-    await appendLog('SUCCESS', `✅ 전체 계정(${accounts.length}개) 작업이 모두 완료되었습니다!`);
-    await chrome.storage.local.set({
-      currentIndex: nextIndex,
-      isRunning: false,
-      step: 'IDLE',
-      waitRetry: 0
-    });
-    await navigateMainTab(logoutUrl);
-    return;
-  }
-
-  await appendLog(
-    isError ? 'ERROR' : 'INFO',
-    `계정 전환 (${reason}) -> 다음 계정(${nextIndex + 1}/${accounts.length}): ${accounts[nextIndex].id}`
-  );
-
-  await chrome.storage.local.set({
-    currentIndex: nextIndex,
-    step: 'NEXT_ACCOUNT_LOGIN',
-    albumIndex: 0,
-    songIndex: 0,
-    waitRetry: 0
-  });
-
-  await navigateMainTab(logoutUrl);
-}
-
-
-// CORS 제한을 피하기 위해 고정된 시트만 백그라운드에서 조회합니다.
-async function getSheetSeeds() {
-  const url = 'https://docs.google.com/spreadsheets/d/e/2PACX-1vQbPI2-Jl21I-hHrIaPTaYIldo3-tJ-4Ml6aTiVZyc8q4az_ETGcOt2iY-E6suHUwbSbsIqXwtq3GGT/pub?output=csv';
-  const controller = new AbortController();
-  const timer = setTimeout(() => controller.abort(), 10000);
+  const tab = tabs.find(t => t.id === state.mainTabId) || tabs[0]; await chrome.tabs.update(tab.id, { active: true });
+  for (const c of clients) if (c.sender.tab.id === tab.id && c.sender.frameId === 0) c.port.postMessage({ type: 'UI_MESSAGE', message: { action: 'SHOW_REMOTE' } });
+});
+chrome.downloads.onCreated.addListener(item => {
+  lock(async () => {
+    const state = await chrome.storage.local.get(['isRunning', 'runId', 'currentIndex', 'songIndex', 'step', PRIVATE + 'events']);
+    if (!state.isRunning || !['SONG_DOWNLOAD', 'PAY_POPUP_STEP1', 'WAIT_DOWNLOAD_STREAM'].includes(state.step)) return;
+    const events = state[PRIVATE + 'events'] || [];
+    const expected = { runId: state.runId, currentIndex: state.currentIndex || 0, songIndex: state.songIndex || 0 };
+    if (events.some(e => JSON.stringify(e.expected) === JSON.stringify(expected))) return;
+    events.push({ id: item.id, url: item.url, referrer: item.referrer, expected });
+    await chrome.storage.local.set({ [PRIVATE + 'events']: events });
+  }).then(pumpEvents).catch(console.error);
+});
+async function pumpEvents() {
+  if (pumping) return; pumping = true;
   try {
-    const response = await fetch(url, {
-      signal: controller.signal, cache: 'no-store', credentials: 'omit'
-    });
-    if (!response.ok) throw new Error('게시된 시트 응답 오류 (' + response.status + '). 시트 게시 상태를 확인해주세요.');
-    const text = await response.text();
-    // CSV 내 따옴표, 쉼표, 셀 내부 줄바꿈을 보존합니다.
-    if (/^\s*</.test(text)) throw new Error('웹에 게시된 시트를 읽을 수 없습니다.');
-    const rows = parseSheetCsv(text);
-    const cell = (row, col) => String(rows[row]?.[col] ?? '').trim();
-    const albumName = cell(2, 2), songName = cell(2, 3);
-    const albumSid = cell(3, 2), songSid = cell(3, 3);
-    if (!albumName || !songName || !/^\d+$/.test(albumSid) || !/^\d+$/.test(songSid)) {
-      throw new Error('C3·D3에 이름, C4·D4에 숫자로 된 시드를 입력해주세요.');
+    for (;;) {
+      const state = await chrome.storage.local.get([PRIVATE + 'events', 'isRunning', 'runId', 'currentIndex', 'songIndex']);
+      const item = state[PRIVATE + 'events']?.[0]; if (!item) return;
+      const stale = !state.isRunning || state.runId !== item.expected.runId || (state.currentIndex || 0) !== item.expected.currentIndex || (state.songIndex || 0) !== item.expected.songIndex;
+      if (!stale) {
+        const selected = await controller(); if (!selected) return;
+        await requestEngine('DOWNLOAD_EVENT', item, selected);
+      }
+      await lock(async () => { const current = await chrome.storage.local.get([PRIVATE + 'events']); await chrome.storage.local.set({ [PRIVATE + 'events']: (current[PRIVATE + 'events'] || []).filter(e => e.id !== item.id) }); });
     }
-    return { albumName, albumSid, songName, songSid };
-  } catch (error) {
-    if (error.name === 'AbortError') throw new Error('시트 응답 시간이 초과되었습니다. 다시 시작해주세요.');
-    throw error;
-  } finally {
-    clearTimeout(timer);
-  }
+  } catch (error) { console.warn('Genie event retained for retry:', error.message); setTimeout(pumpEvents, 1500); }
+  finally { pumping = false; }
 }
-
-
-function parseSheetCsv(text) {
-  const rows = [];
-  let row = [], value = '', quoted = false;
-  text = text.replace(/^\uFEFF/, '');
-  for (let i = 0; i < text.length; i++) {
-    const char = text[i];
-    if (char === '"') {
-      if (quoted && text[i + 1] === '"') { value += '"'; i++; }
-      else quoted = !quoted;
-    } else if (char === ',' && !quoted) {
-      row.push(value); value = '';
-    } else if ((char === '\n' || char === '\r') && !quoted) {
-      if (char === '\r' && text[i + 1] === '\n') i++;
-      row.push(value); rows.push(row); row = []; value = '';
-    } else value += char;
-  }
-  if (quoted) throw new Error('시트 CSV 형식이 올바르지 않습니다.');
-  row.push(value); rows.push(row);
-  return rows;
-}
-
-
-const downloadSteps = ['SONG_DOWNLOAD', 'PAY_POPUP_STEP1', 'WAIT_DOWNLOAD_STREAM'];
-let stateQueue = Promise.resolve();
-function withStateLock(operation) {
-  const result = stateQueue.then(operation);
-  stateQueue = result.catch(() => {});
-  return result;
-}
-
-function sameTask(current, expected) {
-  return current.isRunning && current.runId === expected.runId &&
-    (current.currentIndex || 0) === (expected.currentIndex || 0) &&
-    (current.songIndex || 0) === (expected.songIndex || 0);
-}
-
-// 탭·프레임 사이에서 동일 작업을 한 번만 허용하고 새로고침 후에도 기록을 유지합니다.
-async function claimTaskAction(action, expected) {
-  const allowedSteps = {
-    ALBUM_LIKE: ['ALBUM_LIKE'], SONG_LIKE: ['SONG_LIKE'],
-    PAY_SONG: ['SONG_DOWNLOAD'], PAY_FINAL: downloadSteps,
-    OPEN_LOGIN: ['CHECK_OR_LOGIN'],
-    LOGIN: ['CHECK_OR_LOGIN', 'NEXT_ACCOUNT_LOGIN', 'ALBUM_LIKE', 'SONG_LIKE'],
-    LOGIN_FAILURE: ['CHECK_OR_LOGIN', 'NEXT_ACCOUNT_LOGIN', 'ALBUM_LIKE', 'SONG_LIKE']
-  };
-  if (!expected || !allowedSteps[action]) return false;
-  return withStateLock(async () => {
-    const current = await chrome.storage.local.get(['isRunning', 'runId', 'currentIndex', 'songIndex', 'albumIndex', 'step', 'actionClaims']);
-    if (!sameTask(current, expected) || (current.albumIndex || 0) !== (expected.albumIndex || 0) ||
-        !allowedSteps[action].includes(current.step)) return false;
-    const key = [current.runId || 'legacy', current.currentIndex || 0, current.albumIndex || 0, current.songIndex || 0, action].join(':');
-    const claims = current.actionClaims || {}, previous = claims[key];
-    const cooldown = action === 'LOGIN' ? 10000 : action === 'OPEN_LOGIN' ? 7000 : Infinity;
-    if (previous !== undefined && Date.now() - previous < cooldown) return false;
-    claims[key] = Date.now();
-    const updates = { actionClaims: claims };
-    if (action === 'PAY_SONG') Object.assign(updates, { step: 'PAY_POPUP_STEP1', waitRetry: 0 });
-    if (action === 'PAY_FINAL') Object.assign(updates, { step: 'WAIT_DOWNLOAD_STREAM', waitRetry: 0 });
-    await chrome.storage.local.set(updates);
-    return true;
-  });
-}
+chrome.runtime.onInstalled.addListener(() => { ensureRuntime().catch(() => {}); });
+chrome.runtime.onStartup.addListener(() => { ensureRuntime().catch(() => {}); pumpEvents(); });
