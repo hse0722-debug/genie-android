@@ -1,7 +1,7 @@
 {
   "manifest_version": 3,
   "name": "지니 다중 계정 자동화 (앨범+곡 좋아요 & 다운)",
-  "version": "8.5",
+  "version": "8.5.1",
   "description": "지니뮤직 다중 계정 로그인, 앨범/곡 좋아요, 5단계 개별곡 결제 및 다운로드 즉시 계정 전환 엔진",
   "permissions": [
     "activeTab",

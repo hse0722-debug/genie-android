@@ -176,17 +176,17 @@ async function handleAccountRollover(reason, isError) {
 
 // CORS 제한을 피하기 위해 고정된 시트만 백그라운드에서 조회합니다.
 async function getSheetSeeds() {
-  const url = 'https://docs.google.com/spreadsheets/d/1KS0avSMsGkba5zeDb2IZ_v2p1bJGW7uXm5hcDV_2q24/export?format=csv&gid=0';
+  const url = 'https://docs.google.com/spreadsheets/d/e/2PACX-1vQbPI2-Jl21I-hHrIaPTaYIldo3-tJ-4Ml6aTiVZyc8q4az_ETGcOt2iY-E6suHUwbSbsIqXwtq3GGT/pub?output=csv';
   const controller = new AbortController();
   const timer = setTimeout(() => controller.abort(), 10000);
   try {
     const response = await fetch(url, {
       signal: controller.signal, cache: 'no-store', credentials: 'omit'
     });
-    if (!response.ok) throw new Error('시트 응답 오류 (' + response.status + '). 공유 설정을 확인해주세요.');
+    if (!response.ok) throw new Error('게시된 시트 응답 오류 (' + response.status + '). 시트 게시 상태를 확인해주세요.');
     const text = await response.text();
     // CSV 내 따옴표, 쉼표, 셀 내부 줄바꿈을 보존합니다.
-    if (/^\s*</.test(text)) throw new Error('시트 보기 권한을 확인해주세요.');
+    if (/^\s*</.test(text)) throw new Error('웹에 게시된 시트를 읽을 수 없습니다.');
     const rows = parseSheetCsv(text);
     const cell = (row, col) => String(rows[row]?.[col] ?? '').trim();
     const albumName = cell(2, 2), songName = cell(2, 3);
