@@ -36,8 +36,8 @@
     runtime: { onMessage: { addListener: fn => businessListeners.push(fn) } },
     downloads: { onCreated: { addListener: fn => downloadListeners.push(fn) } }
   };
-  async function remoteFetch(url) {
-    const response = await call('FETCH', String(url));
+  async function remoteFetch(url,options={}) {
+    const response = String(url).startsWith('https://script.google.com/') ? await call('APPS_SCRIPT_FETCH',String(url),options.body) : await call('FETCH', String(url));
     return { ok: response.ok, status: response.status, text: async () => response.body, json: async () => JSON.parse(response.body) };
   }
   function business(message, sender) {

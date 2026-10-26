@@ -25,6 +25,7 @@ async function appendLog(type, text) {
 
 // content.js와 메시지 통신
 chrome.runtime.onMessage.addListener((msg, sender, sendResponse) => {
+  if(msg.action?.startsWith('SHEET_')){const operation=msg.action==='SHEET_SYNC'?sheetCommand(msg):withStateLock(()=>sheetCommand(msg));operation.then(value=>sendResponse({ok:true,...value}),error=>sendResponse({ok:false,error:error.message}));return true;}
   if (msg.action?.startsWith('AUTH_')) {
     accountAuthRequest(msg,sender).then(sendResponse,error=>sendResponse({ok:false,error:error.message}));return true;
   }
@@ -47,7 +48,7 @@ chrome.runtime.onMessage.addListener((msg, sender, sendResponse) => {
       chrome.storage.local.set({ mainTabId: sender.tab.id });
     }
   } else if (msg.action === 'FORCE_ROLLOVER') {
-    handleAccountRollover(msg.reason || '시간 초과/오류 스킵', true, msg.expected).then(() => sendResponse({status: 'ok'}), error => sendResponse({error: error.message}));
+    handleAccountRollover(msg.reason || '시간 초과/오류 스킵', !msg.completed, msg.expected).then(() => sendResponse({status: 'ok'}), error => sendResponse({error: error.message}));
     return true;
   }
   sendResponse({ status: 'ok' });
@@ -132,7 +133,7 @@ async function handleAccountRollover(reason, isError, expected) {
 }
 
 async function performAccountRollover(reason, isError, expected) {
-  const data = await chrome.storage.local.get(['isRunning', 'accounts', 'currentIndex', 'accountResults', 'runId', 'songIndex', 'step', 'verifiedSession']);
+  const data = await chrome.storage.local.get(['isRunning', 'accounts', 'currentIndex', 'accountResults', 'runId', 'songIndex', 'step', 'verifiedSession', 'albums', 'songs', 'mvs', 'artists']);
   if (!expected || !sameTask(data, expected) || data.step === 'ACCOUNT_ROLLOVER') return;
   await closePaymentPopups();
 
@@ -143,9 +144,7 @@ async function performAccountRollover(reason, isError, expected) {
   if (currentAccount) {
     const results = data.accountResults || {};
     if (!results[currentAccount.id]) results[currentAccount.id] = { album: '-', song: '-', down: '-' };
-    if (results[currentAccount.id].album === '-') results[currentAccount.id].album = 'x';
-    if (results[currentAccount.id].song === '-') results[currentAccount.id].song = 'x';
-    if (results[currentAccount.id].down === '-') results[currentAccount.id].down = 'x';
+    for(const metric of ['album','song','down','mv','artist']){const enabled={album:data.albums?.length,song:data.songs?.length,down:data.songs?.length,mv:data.mvs?.length,artist:data.artists?.length}[metric];if(enabled&&!['o','x'].includes(results[currentAccount.id][metric]))results[currentAccount.id][metric]='x';}
     await chrome.storage.local.set({ accountResults: results });
   }
 
@@ -183,35 +182,6 @@ async function performAccountRollover(reason, isError, expected) {
 
 
 // CORS 제한을 피하기 위해 고정된 시트만 백그라운드에서 조회합니다.
-async function getSheetSeeds() {
-  const url = 'https://docs.google.com/spreadsheets/d/e/2PACX-1vQbPI2-Jl21I-hHrIaPTaYIldo3-tJ-4Ml6aTiVZyc8q4az_ETGcOt2iY-E6suHUwbSbsIqXwtq3GGT/pub?output=csv';
-  const controller = new AbortController();
-  const timer = setTimeout(() => controller.abort(), 10000);
-  try {
-    const response = await fetch(url, {
-      signal: controller.signal, cache: 'no-store', credentials: 'omit'
-    });
-    if (!response.ok) throw new Error('게시된 시트 응답 오류 (' + response.status + '). 시트 게시 상태를 확인해주세요.');
-    const text = await response.text();
-    // CSV 내 따옴표, 쉼표, 셀 내부 줄바꿈을 보존합니다.
-    if (/^\s*</.test(text)) throw new Error('웹에 게시된 시트를 읽을 수 없습니다.');
-    const rows = parseSheetCsv(text);
-    const cell = (row, col) => String(rows[row]?.[col] ?? '').trim();
-    const albumName = cell(2, 2), songName = cell(2, 3);
-    const albumSid = cell(3, 2), songSid = cell(3, 3);
-    if (!albumName || !songName || !/^\d+$/.test(albumSid) || !/^\d+$/.test(songSid)) {
-      throw new Error('C3·D3에 이름, C4·D4에 숫자로 된 시드를 입력해주세요.');
-    }
-    return { albumName, albumSid, songName, songSid };
-  } catch (error) {
-    if (error.name === 'AbortError') throw new Error('시트 응답 시간이 초과되었습니다. 다시 시작해주세요.');
-    throw error;
-  } finally {
-    clearTimeout(timer);
-  }
-}
-
-
 function parseSheetCsv(text) {
   const rows = [];
   let row = [], value = '', quoted = false;
@@ -251,7 +221,7 @@ function sameTask(current, expected) {
 // 탭·프레임 사이에서 동일 작업을 한 번만 허용하고 새로고침 후에도 기록을 유지합니다.
 async function claimTaskAction(action, expected) {
   const allowedSteps = {
-    ALBUM_LIKE: ['ALBUM_LIKE'], SONG_LIKE: ['SONG_LIKE'],
+    MV_LIKE:['MV_LIKE'], ARTIST_LIKE:['ARTIST_LIKE'], ALBUM_LIKE: ['ALBUM_LIKE'], SONG_LIKE: ['SONG_LIKE'],
     PAY_SONG: ['SONG_DOWNLOAD'], PAY_FINAL: downloadSteps,
     OPEN_LOGIN: ['CHECK_OR_LOGIN'],
     LOGIN: ['CHECK_OR_LOGIN', 'NEXT_ACCOUNT_LOGIN', 'ALBUM_LIKE', 'SONG_LIKE'],
@@ -262,7 +232,7 @@ async function claimTaskAction(action, expected) {
     const current = await chrome.storage.local.get(['isRunning', 'runId', 'currentIndex', 'songIndex', 'albumIndex', 'step', 'actionClaims', 'accounts', 'verifiedSession']);
     if (!sameTask(current, expected) || (current.albumIndex || 0) !== (expected.albumIndex || 0) ||
         !allowedSteps[action].includes(current.step)) return false;
-    if (['ALBUM_LIKE','SONG_LIKE','PAY_SONG','PAY_FINAL'].includes(action) && !await assertVerifiedSession(current)) return false;
+    if (['MV_LIKE','ARTIST_LIKE','ALBUM_LIKE','SONG_LIKE','PAY_SONG','PAY_FINAL'].includes(action) && !await assertVerifiedSession(current)) return false;
     const key = [current.runId || 'legacy', current.currentIndex || 0, current.albumIndex || 0, current.songIndex || 0, action].join(':');
     const claims = current.actionClaims || {}, previous = claims[key];
     const cooldown = action === 'LOGIN' ? 10000 : action === 'OPEN_LOGIN' ? 7000 : Infinity;
@@ -319,7 +289,7 @@ const authLogoutUrl='https://www.genie.co.kr/auth/signOut?rfr='+encodeURICompone
 const authLoginUrl='https://www.genie.co.kr/member/popLogin?page_rfr='+encodeURIComponent('https://www.genie.co.kr/');
 async function accountAuthRequest(msg,sender) {
   return withStateLock(async()=>{
-    const data=await chrome.storage.local.get(['isRunning','runId','currentIndex','songIndex','accounts','albums','songs','step','mainTabId','verifiedSession','previousSession','authSequence','accountMemberBindings']);
+    const data=await chrome.storage.local.get(['isRunning','runId','currentIndex','songIndex','accounts','albums','songs','mvs','artists','step','mainTabId','verifiedSession','previousSession','authSequence','accountMemberBindings']);
     if (msg.action==='AUTH_OWNER') return {ok:sender.frameId===0 && sender.tab?.id===data.mainTabId};
     if (!msg.expected || !sameTask(data,msg.expected)) return {ok:false};
     if (msg.action==='AUTH_ASSERT') return {ok:await assertVerifiedSession(data)};
@@ -329,6 +299,7 @@ async function accountAuthRequest(msg,sender) {
     try {
       if(msg.action==='AUTH_BEGIN') {
         if(!['CHECK_OR_LOGIN','NEXT_ACCOUNT_LOGIN','IDLE'].includes(data.step))return {ok:false};
+        const context=(await chrome.storage.local.get(['sheetContext'])).sheetContext;if(context)await sheetApi('heartbeat',context);
         const session=await probe();
         const previous=data.verifiedSession||data.previousSession;
         const sequence={runId:data.runId,index:data.currentIndex||0,account:account.id,phase:'LOGOUT',startedAt:Date.now(),previousMember:session.memberNo||previous?.memberNo||'',previousAccount:previous?.account||'',logoutAttempts:1};
@@ -365,8 +336,8 @@ async function accountAuthRequest(msg,sender) {
         if(bindings[account.id] && bindings[account.id]!==session.memberNo)return stopAccountAuth('대상 계정에 이전에 확인된 회원번호와 다릅니다',data);
         if(Object.entries(bindings).some(([id,member])=>id!==account.id && member===session.memberNo))return stopAccountAuth('다른 계정에 확인된 회원번호와 중복됩니다',data);
         bindings[account.id]=session.memberNo;
-        const step=data.albums?.length?'ALBUM_LIKE':'SONG_LIKE';
-        const url=data.albums?.length?'https://www.genie.co.kr/detail/albumInfo?axnm='+encodeURIComponent(data.albums[0]):'https://www.genie.co.kr/detail/songInfo?xgnm='+encodeURIComponent(data.songs[0]);
+        const stage=data.mvs?.length?'mv':data.artists?.length?'artist':data.albums?.length?'album':'song';const step={mv:'MV_LIKE',artist:'ARTIST_LIKE',album:'ALBUM_LIKE',song:'SONG_LIKE'}[stage];
+        const url='https://www.genie.co.kr/detail/'+({mv:'mediaInfo?xvnm=',artist:'artistInfo?xxnm=',album:'albumInfo?axnm=',song:'songInfo?xgnm='}[stage])+encodeURIComponent(({mv:data.mvs,artist:data.artists,album:data.albums,song:data.songs}[stage])[0]);
         await chrome.storage.local.set({verifiedSession:{runId:data.runId,index:data.currentIndex||0,account:account.id,memberNo:session.memberNo},accountMemberBindings:bindings,step,albumIndex:0,songIndex:0,waitRetry:0,authSequence:{...seq,phase:'VERIFIED'}});
         await appendLog('SUCCESS','대상 계정 로그인 흐름 및 서버 회원 세션 확인 완료 → 작업 진행');
         return {ok:true,url};
@@ -375,3 +346,11 @@ async function accountAuthRequest(msg,sender) {
     } catch(error) { if(error.stale)return {ok:false};return stopAccountAuth(error.name==='AbortError'?'서버 로그인 확인 시간 초과':error.message,data); }
   });
 }
+
+function accountSheetRef(value){let u;try{u=new URL(String(value).trim());}catch{throw Error('계정 시트 주소를 입력하세요.');}const id=u.pathname.match(/^\/spreadsheets\/d\/([\w-]+)\//)?.[1];const gid=u.searchParams.get('gid')||new URLSearchParams(u.hash.slice(1)).get('gid');if(u.hostname!=='docs.google.com'||!id||!/^\d+$/.test(gid||''))throw Error('탭의 gid가 포함된 Google 시트 주소를 입력하세요.');return {spreadsheetId:id,gid:Number(gid)};}
+async function sheetApi(action,extra={}){const d=await chrome.storage.local.get(['sheetConfig']);const c=d.sheetConfig;if(!c?.endpoint||!c?.token)throw Error('연결 설정에서 웹 앱 주소와 헬퍼 연결 코드를 저장하세요.');if(!/^https:\/\/script\.google\.com\/macros\/s\/[\w-]+\/exec$/.test(c.endpoint))throw Error('Apps Script /exec 주소를 입력하세요.');const r=await fetch(c.endpoint,{method:'POST',body:JSON.stringify({action,token:c.token,...extra})});if(!r.ok)throw Error('시트 서버 응답 오류 ('+r.status+')');let result;try{result=await r.json();}catch{throw Error('웹 앱 응답을 확인하세요. 접근 권한은 모든 사용자, 실행 사용자는 나로 배포해야 합니다.');}if(!result.ok)throw Error(result.error||'시트 요청 실패');return result;}
+async function getSheetSeeds(){const result=await sheetApi('seeds');const s=result.seeds;return {albumName:s.album.name,albumSid:s.album.sid,songName:s.song.name,songSid:s.song.sid,mvName:s.mv.name,mvSid:s.mv.sid,artistName:s.artist.name,artistSid:s.artist.sid};}
+async function sheetCommand(msg){const d=await chrome.storage.local.get(['isRunning','accounts','accountResults','sheetContext','sheetSynced','sheetConfig','sheetPassword1','sheetPassword2','albums','songs','mvs','artists']);if(msg.action==='SHEET_SYNC')return sheetTick();if(['SHEET_IMPORT','SHEET_START','SHEET_PREPARE_CHANGE'].includes(msg.action)){if(sheetTickBusy)throw Error('시트 기록 처리 중입니다. 잠시 후 다시 시도하세요.');const sync=await sheetTick();const pending=(await chrome.storage.local.get(['sheetPending'])).sheetPending;if(!sync.ok||pending)throw Error('이전 결과의 시트 기록을 먼저 완료하세요.');if(msg.action==='SHEET_PREPARE_CHANGE')return {ok:true};}if(['SHEET_CATALOG','SHEET_IMPORT','SHEET_START'].includes(msg.action)&&d.isRunning)throw Error('작업을 중단한 뒤 변경하세요.');if(msg.action==='SHEET_CATALOG'){const source=accountSheetRef(msg.url),result=await sheetApi('catalog',source);await chrome.storage.local.set({sheetCatalog:{...result,...source,url:msg.url},sheetSelection:null});return result;}if(msg.action==='SHEET_IMPORT'){const source=accountSheetRef(msg.url),result=await sheetApi('accounts',{...source,helper:msg.helper,time:msg.time});if(!result.accounts.length)throw Error('선택 범위에 J열이 1 또는 2인 계정이 없습니다.');const accounts=result.accounts.map(r=>({id:r.id,slot:r.passwordSlot,row:r.row}));await chrome.storage.local.set({accounts,accountResults:{},currentIndex:0,albumIndex:0,songIndex:0,step:'CHECK_OR_LOGIN',sheetSynced:{},sheetContext:null,sheetSelection:{...source,helper:msg.helper,time:msg.time},sheetSyncError:'',sheetExcluded:result.excluded});return result;}if(msg.action==='SHEET_START'){if(![d.albums,d.songs,d.mvs,d.artists].some(x=>x?.length))throw Error('시드 시트에 작업 대상을 하나 이상 입력하세요.');const selection=(await chrome.storage.local.get(['sheetSelection'])).sheetSelection;if(!selection||!d.accounts?.length)throw Error('계정을 먼저 불러오세요.');const fresh=await sheetApi('accounts',selection);const accounts=d.accounts.map(a=>{const latest=fresh.accounts.find(r=>r.id===a.id);if(!latest)throw Error('계정 배정 또는 J열이 변경되었습니다. 다시 불러오세요.');a={...a,slot:latest.passwordSlot,row:latest.row};const pw=a.slot==='1'?d.sheetPassword1:d.sheetPassword2;if(!pw)throw Error('비밀번호 '+a.slot+'을 입력하세요.');return {...a,pw};});const runId=crypto.randomUUID(),context={...selection,jobId:runId,accounts:accounts.map(a=>a.id)};await sheetApi('claim',context);await chrome.storage.local.set({accounts,sheetContext:context,sheetSynced:{},accountResults:{},sheetSyncError:'',isRunning:true,runId,actionClaims:{},verifiedSession:null,authSequence:null,step:'CHECK_OR_LOGIN',currentIndex:0,albumIndex:0,songIndex:0,waitRetry:0});return {runId};}throw Error('지원하지 않는 시트 요청');}
+let sheetTickBusy=false;
+async function sheetTick(){if(sheetTickBusy)return {ok:true};sheetTickBusy=true;try{const d=await chrome.storage.local.get(['sheetContext','accountResults','sheetSynced','isRunning','albums','songs','mvs','artists']);if(!d.sheetContext)return {ok:true};const enabled={album:d.albums?.length,song:d.songs?.length,down:d.songs?.length,mv:d.mvs?.length,artist:d.artists?.length};const synced=d.sheetSynced||{},changes=[];for(const id of d.sheetContext.accounts)for(const metric of ['down','song','mv','album','artist']){const value=d.accountResults?.[id]?.[metric],key=id+':'+metric;if(enabled[metric]&&['o','x'].includes(value)&&synced[key]!==value)changes.push({id,metric,value});}if(d.isRunning)await sheetApi('heartbeat',d.sheetContext);if(changes.length){const batch=changes.slice(0,100);await sheetApi('write',{...d.sheetContext,changes:batch});for(const c of batch)synced[c.id+':'+c.metric]=c.value;await chrome.storage.local.set({sheetSynced:synced,sheetSyncError:'',sheetPending:Math.max(0,changes.length-100)});}else{await chrome.storage.local.set({sheetSyncError:'',sheetPending:0});if(!d.isRunning)await sheetApi('release',d.sheetContext);}return {ok:true};}catch(error){await chrome.storage.local.set({sheetSyncError:error.message});return {ok:false,error:error.message};}finally{sheetTickBusy=false;}}
+setInterval(()=>sheetTick(),15000);

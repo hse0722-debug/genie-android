@@ -42,8 +42,8 @@ function getNextStageUrl(nextStep, data) {
     nextStep = 'NEXT_ACCOUNT_LOGIN';
   }
   return {
-    step: 'NEXT_ACCOUNT_LOGIN',
-    url: "https://www.genie.co.kr/auth/signOut?rfr=" + encodeURIComponent("https://www.genie.co.kr/")
+    step: 'FINISH_ACCOUNT',
+    url: "https://www.genie.co.kr/"
   };
 }
 
@@ -89,7 +89,8 @@ async function loadSheetSeeds() {
     const previous = await chrome.storage.local.get(['albums', 'songs']);
     const changed = previous.albums?.[0] !== seeds.albumSid || previous.songs?.[0] !== seeds.songSid;
     await chrome.storage.local.set({
-      albums: [seeds.albumSid], songs: [seeds.songSid],
+      albums: seeds.albumSid?[seeds.albumSid]:[], songs: seeds.songSid?[seeds.songSid]:[],mvs:seeds.mvSid?[seeds.mvSid]:[],artists:seeds.artistSid?[seeds.artistSid]:[],
+      sheetMvName:seeds.mvName,sheetArtistName:seeds.artistName,
       sheetAlbumName: seeds.albumName, sheetSongName: seeds.songName,
       ...(changed ? { step: 'CHECK_OR_LOGIN', albumIndex: 0, songIndex: 0 } : {})
     });
@@ -106,399 +107,48 @@ async function loadSheetSeeds() {
 // =========================================================
 // 1. 플로팅 리모컨 대시보드 UI (결제/다운로드 팝업창 제외 처리)
 // =========================================================
-async function createFloatingPanel() {
-  const url = window.location.href;
-  
-  if (
-    window !== window.top ||
-    url.includes('popLogin') ||
-    url.includes('/buy/') ||
-    url.includes('Popup') ||
-    url.includes('pop')
-  ) {
-    return;
-  }
-
-  if (!document.body) {
-    setTimeout(createFloatingPanel, 100);
-    return;
-  }
-
-  chrome.runtime.sendMessage({ action: 'REGISTER_MAIN_TAB' }).catch(() => {});
-
-  if (!document.getElementById('genie-open-btn')) {
-    const openBtn = document.createElement('button');
-    openBtn.id = 'genie-open-btn';
-    openBtn.innerHTML = '🎵 도우미 열기';
-    openBtn.style.cssText = `
-      position: fixed; bottom: 15px; right: 15px; z-index: 2147483646;
-      background: #2980b9; color: white; border: none; padding: 10px 15px;
-      border-radius: 25px; font-weight: bold; font-size: 12px; cursor: pointer;
-      box-shadow: 0 4px 12px rgba(0,0,0,0.3); font-family: 'Malgun Gothic', sans-serif;
-    `;
-    openBtn.onclick = async () => {
-      const dash = document.getElementById('genie-helper-dashboard');
-      if (dash) {
-        dash.style.display = 'block';
-        await chrome.storage.local.set({ panelHidden: false });
-      }
-    };
-    document.body.appendChild(openBtn);
-  }
-
-  if (document.getElementById('genie-helper-dashboard')) return;
-
-  const posData = await chrome.storage.local.get(['panelPos', 'panelHidden']);
-  const panel = document.createElement('div');
-  panel.id = 'genie-helper-dashboard';
-
-  let posStyle = 'bottom: 60px; right: 15px;';
-  if (posData.panelPos && posData.panelPos.left && posData.panelPos.top) {
-    posStyle = `left: ${posData.panelPos.left}; top: ${posData.panelPos.top};`;
-  }
-  const displayStyle = posData.panelHidden ? 'none' : 'block';
-
-  panel.style.cssText = `
-    position: fixed; ${posStyle} display: ${displayStyle};
-    width: 430px; max-width: calc(100vw - 30px); box-sizing: border-box; max-height: 85vh; overflow-y: auto;
-    background: #ffffff; color: #333333; border-radius: 10px;
-    box-shadow: 0 8px 30px rgba(0,0,0,0.35); z-index: 2147483647;
-    font-family: 'Malgun Gothic', sans-serif; border: 2px solid #2c3e50; text-align: left;
-  `;
-
-  panel.innerHTML = `
-    <div id="dash-header" style="background:#2c3e50; color:white; padding:10px 14px; cursor:move; display:flex; justify-content:space-between; align-items:center; border-radius:7px 7px 0 0; user-select:none;">
-      <span style="font-weight:bold; font-size:13px;">🎵 지니 다운 도우미 ${globalThis.__genieRuntimeVersion || "9.0.0"} [포레스텔라음원총공팀 제작]</span>
-      <button id="btn-close-dash" style="background:#e74c3c; color:white; border:none; padding:3px 8px; border-radius:4px; cursor:pointer; font-weight:bold; font-size:11px;">숨기기 _</button>
-    </div>
-
-    <div style="padding: 12px;">
-      <!-- 상단 상태 알림 및 시작/중단 버튼 -->
-      <div style="background:#f8f9fa; padding:10px; border:1px solid #ddd; border-radius:6px; margin-bottom:10px;">
-        <div style="margin-bottom:8px; font-size:11px; line-height:1.4;">
-          <b>상태 알림:</b> <span id="dash-last-log" style="color:#d35400; font-weight:bold;">대기 중</span><br>
-          <span id="dash-summary" style="color:#2980b9; font-weight:bold;">데이터 로드 중...</span>
-        </div>
-        <div style="display:flex; gap:6px;">
-          <button id="btn-resume" style="flex:1; padding:8px; background:#2980b9; color:white; border:none; border-radius:4px; font-weight:bold; cursor:pointer; font-size:12px;">▶ 시작 (이어서 열기)</button>
-          <button id="btn-stop" style="flex:1; padding:8px; background:#c0392b; color:white; border:none; border-radius:4px; font-weight:bold; cursor:pointer; font-size:12px;">⏸ 중단 · 위치저장</button>
-        </div>
-      </div>
-
-      <!-- 계정 파일 버튼 및 구글 시트 고정 SID 표시 -->
-      <div style="margin-bottom:10px; border:1px solid #ddd; border-radius:6px; padding:8px; background:#fafafa;">
-        <div style="display:flex; gap:4px; margin-bottom:6px;">
-          <button id="btn-load-acc" style="flex:1; padding:6px 4px; background:#ecf0f1; border:1px solid #bdc3c7; border-radius:4px; cursor:pointer; font-weight:bold; font-size:11px;">📁 계정(.txt)</button>
-          <input type="file" id="file-acc" accept=".txt" style="display:none;">
-          <button id="btn-reset-all" style="padding:6px 8px; background:#95a5a6; color:white; border:none; border-radius:4px; cursor:pointer; font-weight:bold; font-size:11px;">초기화</button>
-        </div>
-        <!-- C3: C4, D3: D4 형식의 읽기 전용 표시 -->
-        <div style="font-size:12px; line-height:1.6; overflow-wrap:anywhere;">
-          <div id="sheet-album-seed">앨범 정보 불러오는 중...</div>
-          <div id="sheet-song-seed">곡 정보 불러오는 중...</div>
-          <div id="sheet-seed-status" role="status" style="font-size:11px; color:#666;"></div>
-        </div>
-      </div>
-
-      <!-- 계정별 진행 현황 테이블 -->
-      <div id="dash-table-wrap" style="max-height: 150px; overflow-y: auto; border:1px solid #ddd; display:block; margin-bottom:10px;">
-        <table style="width:100%; border-collapse:collapse; font-size:11px; text-align:center;">
-          <thead style="position: sticky; top: 0; background:#ecf0f1; z-index:2;">
-            <tr>
-              <th style="padding:5px; border:1px solid #ddd;">아이디</th>
-              <th style="padding:5px; border:1px solid #ddd;">순서</th>
-              <th style="padding:5px; border:1px solid #ddd;">앨범 좋아요</th>
-              <th style="padding:5px; border:1px solid #ddd;">곡 좋아요</th>
-              <th style="padding:5px; border:1px solid #ddd;">다운</th>
-            </tr>
-          </thead>
-          <tbody id="dash-table-body">
-            <tr><td colspan="5" style="padding:10px;">계정 파일을 불러오세요.</td></tr>
-          </tbody>
-        </table>
-      </div>
-
-      <!-- 실시간 성공/에러 로그 뷰어 및 .txt 다운로드 -->
-      <div style="border:1px solid #ddd; border-radius:6px; padding:8px; background:#f8f9fa;">
-        <div style="display:flex; justify-content:space-between; align-items:center; margin-bottom:5px;">
-          <b style="font-size:11px; color:#2c3e50;">📋 실시간 성공 / 에러 로그</b>
-          <div style="display:flex; gap:4px;">
-            <button id="btn-down-log" style="background:#2980b9; color:white; border:none; padding:3px 8px; border-radius:3px; cursor:pointer; font-size:11px; font-weight:bold;">💾 로그 .txt 저장</button>
-            <button id="btn-clear-log" style="background:#7f8c8d; color:white; border:none; padding:3px 6px; border-radius:3px; cursor:pointer; font-size:11px;">지우기</button>
-          </div>
-        </div>
-        <div id="dash-log-box" style="height:100px; overflow-y:auto; background:#1e272e; color:#d2dae2; padding:6px; border-radius:4px; font-family:Consolas, monospace; font-size:11px; line-height:1.4; white-space:pre-wrap; word-break:break-all;">로그 대기 중...</div>
-      </div>
-    </div>
-  `;
-  document.body.appendChild(panel);
-
-  const header = document.getElementById('dash-header');
-  let isDragging = false, offsetX = 0, offsetY = 0;
-
-  header.addEventListener('mousedown', (e) => {
-    if (e.target.id === 'btn-close-dash') return;
-    isDragging = true;
-    const rect = panel.getBoundingClientRect();
-    offsetX = e.clientX - rect.left;
-    offsetY = e.clientY - rect.top;
-    panel.style.bottom = 'auto';
-    panel.style.right = 'auto';
-    panel.style.left = rect.left + 'px';
-    panel.style.top = rect.top + 'px';
-  });
-
-  document.addEventListener('mousemove', (e) => {
-    if (!isDragging) return;
-    panel.style.left = (e.clientX - offsetX) + 'px';
-    panel.style.top = (e.clientY - offsetY) + 'px';
-  });
-
-  document.addEventListener('mouseup', async () => {
-    if (isDragging) {
-      isDragging = false;
-      await chrome.storage.local.set({ panelPos: { left: panel.style.left, top: panel.style.top } });
-    }
-  });
-
-  document.getElementById('btn-close-dash').onclick = async () => {
-    panel.style.display = 'none';
-    await chrome.storage.local.set({ panelHidden: true });
-  };
-
-  async function handleAccountFile(file) {
-    if (!file) return;
-    const text = await file.text();
-    const lines = text.split(/\r?\n/).map(l => l.trim()).filter(l => l && !l.startsWith('#'));
-    
-    // 탭, 쉼표, 스페이스바 공백을 모두 구분자로 처리
-    const result = lines.map(l => {
-      const p = l.split(/[\t, ]+/);
-      return { id: p[0]?.trim(), pw: p[1]?.trim() };
-    }).filter(a => a.id && a.pw);
-
-    await chrome.storage.local.set({ accounts: result, accountResults: {} });
-    await saveLog(`📁 계정 데이터 ${result.length}개 로드 완료`, 'SUCCESS');
-    updateDashboardUI();
-  }
-
-  document.getElementById('btn-load-acc').onclick = () => document.getElementById('file-acc').click();
-  document.getElementById('file-acc').onchange = (e) => {
-    handleAccountFile(e.target.files[0]);
-    e.target.value = '';
-  };
-
-  document.getElementById('btn-resume').onclick = async () => {
-    const startBtn = document.getElementById('btn-resume');
-    if (startBtn.disabled || navigationPending) return;
-    startBtn.disabled = true;
-    let loaded;
-    try { loaded = await loadSheetSeeds(); }
-    finally { startBtn.disabled = false; }
-    if (!loaded) return;
-
-    const data = await chrome.storage.local.get(['accounts', 'step', 'currentIndex', 'albumIndex', 'songIndex', 'albums', 'songs', 'verifiedSession', 'previousSession']);
-    if (!data.accounts || data.accounts.length === 0) {
-      await saveLog('⚠️ 계정 파일을 먼저 등록해주세요!', 'ERROR');
-      return;
-    }
-    if (!data.songs || data.songs.length === 0) {
-      await saveLog('⚠️ 구글 시트의 곡 시드를 확인해주세요!', 'ERROR');
-      return;
-    }
-
-    chrome.runtime.sendMessage({ action: 'REGISTER_MAIN_TAB' }).catch(() => {});
-
-    const pausedDownload = ['SONG_DOWNLOAD', 'PAY_POPUP_STEP1', 'WAIT_DOWNLOAD_STREAM', 'DOWNLOAD_RECEIVED'].includes(data.step);
-    const step = pausedDownload ? 'SONG_LIKE' : (data.step && !['IDLE', 'ACCOUNT_ROLLOVER'].includes(data.step)) ? data.step : 'CHECK_OR_LOGIN';
-    const cIdx = data.currentIndex || 0;
-    const albIdx = data.albumIndex || 0;
-    const sIdx = data.songIndex || 0;
-
-    await chrome.storage.local.set({
-      isRunning: true,
-      runId: crypto.randomUUID(),
-      actionClaims: {},
-      downloadWaitStartedAt: 0,
-      step: 'CHECK_OR_LOGIN',
-      previousSession: data.verifiedSession || data.previousSession || null,
-      verifiedSession: null, authSequence: null,
-      currentIndex: cIdx,
-      albumIndex: 0,
-      songIndex: 0,
-      waitRetry: 0
-    });
-
-    await saveLog(`▶ 자동화 작업 시작 (${cIdx + 1}번 계정: ${data.accounts[cIdx]?.id})`, 'INFO');
-
-    const firstStage = getNextStageUrl('ALBUM_LIKE', data);
-    let targetUrl = "https://www.genie.co.kr/member/popLogin?page_rfr=" + encodeURIComponent(firstStage.url);
-
-    if (step === 'ALBUM_LIKE' && data.albums?.length) {
-      targetUrl = getUrl('album', data.albums[albIdx] || data.albums[0]);
-    } else if ((step === 'SONG_LIKE' || step === 'SONG_DOWNLOAD') && data.songs?.length) {
-      targetUrl = getUrl('song', data.songs[sIdx] || data.songs[0]);
-    }
-
-    navigateTask('https://www.genie.co.kr/');
-  };
-
-  document.getElementById('btn-stop').onclick = async () => {
-    await chrome.storage.local.set({ isRunning: false });
-    await saveLog('⏸ 작업 중단됨 (현재 위치 저장 완료)', 'ERROR');
-    updateDashboardUI();
-  };
-
-  let resetConfirm = false;
-  const resetBtn = document.getElementById('btn-reset-all');
-  resetBtn.onclick = async () => {
-    if (!resetConfirm) {
-      resetConfirm = true;
-      resetBtn.textContent = '정말 초기화?';
-      resetBtn.style.background = '#e74c3c';
-      setTimeout(() => {
-        resetConfirm = false;
-        if (resetBtn) {
-          resetBtn.textContent = '초기화';
-          resetBtn.style.background = '#95a5a6';
-        }
-      }, 3000);
-      return;
-    }
-    resetConfirm = false;
-    resetBtn.textContent = '초기화';
-    resetBtn.style.background = '#95a5a6';
-    await chrome.storage.local.clear();
-    updateDashboardUI();
-  };
-
-  document.getElementById('btn-down-log').onclick = async () => {
-    const data = await chrome.storage.local.get({ logs: [] });
-    if (!data.logs || data.logs.length === 0) {
-      await saveLog('⚠️ 저장할 로그 내역이 없습니다.', 'ERROR');
-      return;
-    }
-    const blob = new Blob([data.logs.join('\n')], { type: 'text/plain;charset=utf-8' });
-    const urlObj = URL.createObjectURL(blob);
-    const stamp = new Date().toISOString().slice(0, 19).replace(/[:T]/g, '-');
-    const a = document.createElement('a');
-    a.href = urlObj;
-    a.download = `genie_download_log_${stamp}.txt`;
-    document.body.appendChild(a);
-    a.click();
-    document.body.removeChild(a);
-    URL.revokeObjectURL(urlObj);
-  };
-
-  document.getElementById('btn-clear-log').onclick = async () => {
-    await chrome.storage.local.set({ logs: [] });
-    updateDashboardUI();
-  };
-
-  document.getElementById('dash-table-body').addEventListener('click', async (e) => {
-    const tr = e.target.closest('tr[data-idx]');
-    if (!tr) return;
-    const idx = parseInt(tr.getAttribute('data-idx'), 10);
-    if (isNaN(idx)) return;
-    await chrome.storage.local.set({
-      currentIndex: idx,
-      step: 'CHECK_OR_LOGIN',
-      albumIndex: 0,
-      songIndex: 0,
-      isRunning: false,
-      waitRetry: 0
-    });
-    await saveLog(`📌 ${idx + 1}번 계정(${tr.children[0]?.textContent})으로 시작 위치 변경됨`, 'INFO');
-    updateDashboardUI();
-  });
-
-  await updateDashboardUI();
-  const state = await chrome.storage.local.get(['isRunning']);
-  if (!state.isRunning) await loadSheetSeeds();
+async function createFloatingPanel(){
+ if(window!==window.top||/\/buy\/|pop|pay\.genie/i.test(window.location.href)||!document.body)return;
+ chrome.runtime.sendMessage({action:'REGISTER_MAIN_TAB'}).catch(()=>{});
+ if(document.getElementById('genie-helper-dashboard'))return;
+ const d=await chrome.storage.local.get(['sheetConfig','sheetCatalog','sheetSelection','sheetPassword1','sheetPassword2','panelHidden']);
+ if(document.getElementById('genie-helper-dashboard'))return;
+ const p=document.createElement('section');p.id='genie-helper-dashboard';p.style.cssText='position:fixed;right:12px;bottom:54px;width:460px;max-width:calc(100vw - 24px);max-height:88vh;overflow:auto;background:#fff;border-radius:12px;box-shadow:0 8px 30px #0004;z-index:2147483647;color:#172846;font:13px "Malgun Gothic",sans-serif;text-align:left;';
+ p.innerHTML=`<style>#genie-helper-dashboard *{box-sizing:border-box}#genie-helper-dashboard h3{font-size:15px;margin:0 0 10px;color:#07519c}#genie-helper-dashboard .gs-card{margin:10px;padding:12px;border:1px solid #d7e4ef;border-radius:8px;background:linear-gradient(#eff6fc,#fff 45px)}#genie-helper-dashboard label{display:block;font-size:12px;font-weight:bold;margin-bottom:4px}#genie-helper-dashboard input,#genie-helper-dashboard select{width:100%;height:33px;border:1px solid #bdcce0;border-radius:5px;padding:5px;background:white;color:#172846;font:inherit}#genie-helper-dashboard button{border:0;border-radius:5px;padding:8px 10px;cursor:pointer;background:#1688df;color:white;font:inherit;font-weight:bold}#genie-helper-dashboard button:disabled{opacity:.5;cursor:wait}#genie-helper-dashboard .gs-row{display:flex;gap:9px}#genie-helper-dashboard .gs-row>div{flex:1;min-width:0}#genie-helper-dashboard small{display:block;color:#7185a0;font-size:11px;margin-top:7px}#genie-helper-dashboard table{width:100%;border-collapse:collapse;font-size:11px}#genie-helper-dashboard th,#genie-helper-dashboard td{padding:6px 4px;border:1px solid #d5deea;text-align:center;overflow-wrap:anywhere}#genie-helper-dashboard th{background:#edf4fa}#genie-helper-dashboard .gs-status{font-size:11px;white-space:pre-wrap;overflow-wrap:anywhere}#genie-helper-dashboard summary{cursor:pointer;color:#607896}</style>
+ <header id="dash-header" style="padding:14px;background:#0b3768;color:white;display:flex;align-items:center;justify-content:space-between;touch-action:none"><strong>지니 다운 도우미 <small style="display:inline;color:#c6e5ff">${globalThis.__genieRuntimeVersion||'10.0.0'}</small></strong><button id="gs-hide" style="background:transparent">숨기기</button></header>
+ <div class="gs-card"><h3>구글 시트 연결</h3><details id="gs-settings"><summary>연결 설정</summary><label>Apps Script 웹 앱 주소</label><input id="gs-endpoint" placeholder="https://script.google.com/macros/s/…/exec"><label style="margin-top:8px">헬퍼 연결 코드</label><input id="gs-token" type="password" autocomplete="off"><button id="gs-save" style="margin:8px 0">연결 설정 저장</button></details><label style="margin-top:10px">계정 시트 주소</label><div class="gs-row"><input id="gs-url" placeholder="gid가 포함된 시트 탭 주소"><button id="gs-catalog" style="white-space:nowrap">불러오기</button></div><div class="gs-row" style="margin-top:10px"><div><label>작업 시간</label><select id="gs-time"></select></div><div><label>담당 헬퍼</label><select id="gs-helper"></select></div></div><button id="gs-import" style="margin-top:8px;width:100%">선택한 계정 불러오기</button><small id="dash-summary">계정을 불러오세요.</small><div id="gs-connection" class="gs-status"></div></div>
+ <div class="gs-card"><h3>로그인 비밀번호</h3><div class="gs-row"><div><label>비밀번호 1</label><input id="gs-password1" type="password" autocomplete="off"></div><div><label>비밀번호 2</label><input id="gs-password2" type="password" autocomplete="off"></div></div><small>시트 J열의 1·2에 따라 자동 선택 · 이 브라우저에만 저장</small></div>
+ <div class="gs-card"><h3>작업 대상</h3><table><thead><tr><th>항목</th><th>이름</th><th>시드</th></tr></thead><tbody>${[['album','앨범'],['song','곡'],['mv','뮤비'],['artist','가수']].map(([key,label])=>`<tr><td>${label}</td><td id="gs-${key}-name"></td><td id="gs-${key}-sid"></td></tr>`).join('')}</tbody></table><small>시트에 없는 항목은 공란 · 작업 제외</small><div id="sheet-seed-status" class="gs-status"></div></div>
+ <div class="gs-row" style="margin:10px"><button id="btn-resume" style="flex:1;font-size:18px">▶ 시작</button><button id="btn-stop" style="flex:1;background:#d55b67;font-size:18px">Ⅱ 중단</button></div>
+ <div class="gs-card"><h3>계정별 진행 현황</h3><div style="max-height:170px;overflow:auto"><table><thead><tr>${['아이디','비번','다운','곡','뮤비','앨범','가수'].map(v=>`<th>${v}</th>`).join('')}</tr></thead><tbody id="dash-table-body"></tbody></table></div><small>E~I열에 결과 자동 기록 · 다운 o = 다운로드 시작 감지</small><div id="gs-sync" class="gs-status"></div><button id="gs-sync-now" style="margin-top:7px">결과 기록 재시도</button></div>
+ <div class="gs-card"><h3>상태 알림</h3><div id="dash-last-log" class="gs-status">대기 중</div><details style="margin-top:8px"><summary>작업 로그</summary><div id="dash-log-box" style="max-height:140px;overflow:auto;font-size:10px"></div><button id="gs-log">로그 저장</button></details></div>`;
+ document.body.appendChild(p);const el=id=>document.getElementById(id);el('gs-endpoint').value=d.sheetConfig?.endpoint||'';el('gs-token').value=d.sheetConfig?.token||'';el('gs-url').value=d.sheetCatalog?.url||'https://docs.google.com/spreadsheets/d/14SWMDCFfxYGFAuoTMxahDKTcranKXmyfVDu31SH7OEw/edit?gid=1705416226';el('gs-password1').value=d.sheetPassword1||'';el('gs-password2').value=d.sheetPassword2||'';
+ const guarded=fn=>async e=>{const button=e?.currentTarget;if(button?.tagName==='BUTTON')button.disabled=true;try{await fn();}catch(error){el('gs-connection').textContent=error.message;}finally{if(button)button.disabled=false;}};
+ const message=async msg=>{const r=await chrome.runtime.sendMessage(msg);if(!r?.ok)throw Error(r?.error||'시트 연결 실패');return r;};
+ const idle=async()=>{if((await chrome.storage.local.get(['isRunning'])).isRunning)throw Error('작업 중에는 설정을 바꿀 수 없습니다. 먼저 중단하세요.');};
+ el('gs-save').onclick=guarded(async()=>{await idle();await message({action:'SHEET_PREPARE_CHANGE'});await chrome.storage.local.set({sheetConfig:{endpoint:el('gs-endpoint').value.trim(),token:el('gs-token').value.trim()}});el('gs-connection').textContent='연결 설정 저장 완료';await loadSheetSeeds();});
+ const options=(id,values,selected)=>{const node=el(id);node.replaceChildren();for(const value of values){const option=document.createElement('option');option.value=value;option.textContent=value;node.appendChild(option);}if(values.includes(selected))node.value=selected;};
+ const helpersForTime=()=>{const time=el('gs-time').value;const pairs=gsCatalog?.pairs||[];options('gs-helper',[...new Set(pairs.filter(x=>x.time===time).map(x=>x.helper))],el('gs-helper').value);};
+ let gsCatalog=d.sheetCatalog;const fill=selection=>{options('gs-time',gsCatalog?.times||[],selection?.time);helpersForTime();if(selection?.helper)el('gs-helper').value=selection.helper;};fill(d.sheetSelection);
+ const invalidate=()=>chrome.storage.local.set({sheetSelection:null});el('gs-time').onchange=()=>{helpersForTime();invalidate();};el('gs-helper').onchange=invalidate;el('gs-url').onchange=invalidate;
+ el('gs-catalog').onclick=guarded(async()=>{await idle();gsCatalog=await message({action:'SHEET_CATALOG',url:el('gs-url').value.trim()});fill();el('gs-connection').textContent='시트 연결됨 · '+gsCatalog.title;await loadSheetSeeds();});
+ el('gs-import').onclick=guarded(async()=>{await idle();const result=await message({action:'SHEET_IMPORT',url:el('gs-url').value.trim(),helper:el('gs-helper').value,time:el('gs-time').value});el('gs-connection').textContent='계정 '+result.accounts.length+'개 로드'+(result.excluded?' · J열 오류 '+result.excluded+'개 제외':'');});
+ const savePasswords=async()=>{await idle();await chrome.storage.local.set({sheetPassword1:el('gs-password1').value,sheetPassword2:el('gs-password2').value});};
+ for(const id of ['gs-password1','gs-password2'])el(id).onchange=guarded(savePasswords);
+ el('btn-resume').onclick=guarded(async()=>{await idle();await savePasswords();if(!await loadSheetSeeds())return;const r=await message({action:'SHEET_START'});await saveLog('▶ 시트 계정 자동화 시작','INFO');navigateTask('https://www.genie.co.kr/');});
+ el('btn-stop').onclick=guarded(async()=>{await chrome.storage.local.set({isRunning:false});await saveLog('⏸ 작업 중단 · 결과 기록은 재시도 가능','INFO');await message({action:'SHEET_SYNC'});});
+ el('gs-sync-now').onclick=guarded(async()=>{await message({action:'SHEET_SYNC'});});
+ el('gs-log').onclick=guarded(async()=>{const data=await chrome.storage.local.get({logs:[]});const a=document.createElement('a');a.href=URL.createObjectURL(new Blob([data.logs.join('\n')],{type:'text/plain;charset=utf-8'}));a.download='genie_download_log_'+new Date().toISOString().replace(/[:.]/g,'-')+'.txt';a.click();setTimeout(()=>URL.revokeObjectURL(a.href),1000);});
+ let open=el('genie-open-btn');if(!open){open=document.createElement('button');open.id='genie-open-btn';open.textContent='🎵 도우미 열기';open.style.cssText='position:fixed;bottom:12px;right:12px;z-index:2147483646;padding:9px;border:0;border-radius:20px;background:#1688df;color:white;';document.body.appendChild(open);}open.onclick=()=>{p.style.display='block';chrome.storage.local.set({panelHidden:false});};el('gs-hide').onclick=()=>{p.style.display='none';chrome.storage.local.set({panelHidden:true});};if(d.panelHidden)p.style.display='none';
+ const header=el('dash-header');let drag;header.onpointerdown=e=>{if(e.target.closest('button'))return;drag={x:e.clientX,y:e.clientY,left:p.getBoundingClientRect().left,top:p.getBoundingClientRect().top};header.setPointerCapture(e.pointerId);};header.onpointermove=e=>{if(!drag)return;p.style.left=Math.max(0,Math.min(window.innerWidth-p.offsetWidth,drag.left+e.clientX-drag.x))+'px';p.style.top=Math.max(0,drag.top+e.clientY-drag.y)+'px';p.style.right='auto';p.style.bottom='auto';};header.onpointerup=()=>{drag=null;};
+ await updateDashboardUI();if(d.sheetConfig?.endpoint&&!(await chrome.storage.local.get(['isRunning'])).isRunning)await loadSheetSeeds();message({action:'SHEET_SYNC'}).catch(()=>{});
 }
+async function updateDashboardUI(){const tbody=document.getElementById('dash-table-body');if(!tbody)return;const d=await chrome.storage.local.get(['accounts','accountResults','currentIndex','isRunning','lastActionText','logs','albums','songs','mvs','artists','sheetAlbumName','sheetSongName','sheetMvName','sheetArtistName','sheetSyncError','sheetPending']);const el=id=>document.getElementById(id);for(const [key,list,name] of [['album','albums','sheetAlbumName'],['song','songs','sheetSongName'],['mv','mvs','sheetMvName'],['artist','artists','sheetArtistName']]){el('gs-'+key+'-name').textContent=d[name]||'';el('gs-'+key+'-sid').textContent=d[list]?.[0]||'';}el('dash-last-log').textContent=d.lastActionText||'대기 중';el('dash-summary').textContent='선택한 계정 '+(d.accounts?.length||0)+'개 · '+(d.isRunning?'진행 중':'대기');el('gs-sync').textContent=d.sheetSyncError?'시트 미기록 · '+d.sheetSyncError:d.sheetPending?'기록 대기 '+d.sheetPending+'건':'시트 기록 상태 정상';const mark=v=>['o','x'].includes(v)?'<b style="color:'+(v==='o'?'#00872c':'#d52222')+'">'+v+'</b>':'';tbody.innerHTML=(d.accounts||[]).map((a,i)=>{const r=d.accountResults?.[a.id]||{};return '<tr style="background:'+(i===(d.currentIndex||0)?'#edf6ff':'white')+'"><td>'+escapeHtml(a.id)+'</td><td>'+escapeHtml(a.slot||'')+'</td>'+['down','song','mv','album','artist'].map(k=>'<td>'+mark(r[k])+'</td>').join('')+'</tr>';}).join('')||'<tr><td colspan="7">계정을 불러오세요.</td></tr>';el('dash-log-box').textContent=(d.logs||[]).slice(-150).join('\n');el('dash-log-box').style.whiteSpace='pre-wrap';for(const id of ['gs-save','gs-catalog','gs-import','gs-password1','gs-password2','gs-url','gs-time','gs-helper'])el(id).disabled=!!d.isRunning;}
 
 function renderMark(val) {
   if (val === 'o') return "<b style='color:#27ae60;'>o</b>";
   if (val === 'x') return "<b style='color:#e74c3c;'>x</b>";
   return "<span style='color:#95a5a6;'>-</span>";
-}
-
-async function updateDashboardUI() {
-  const tbody = document.getElementById('dash-table-body');
-  const summary = document.getElementById('dash-summary');
-  const lastLog = document.getElementById('dash-last-log');
-  const logBox = document.getElementById('dash-log-box');
-  const sheetAlbum = document.getElementById('sheet-album-seed');
-  const sheetSong = document.getElementById('sheet-song-seed');
-  if (!tbody) return;
-
-  const data = await chrome.storage.local.get([
-    'accounts', 'albums', 'songs', 'currentIndex', 'albumIndex', 'songIndex', 'isRunning', 'step', 'lastActionText', 'logs', 'accountResults', 'sheetAlbumName', 'sheetSongName'
-  ]);
-  const accs = data.accounts || [];
-  const cIdx = data.currentIndex || 0;
-  const albLen = (data.albums || []).length;
-  const sonLen = (data.songs || []).length;
-  const results = data.accountResults || {};
-
-  if (sheetAlbum) sheetAlbum.textContent = data.sheetAlbumName && data.albums?.[0]
-    ? data.sheetAlbumName + ': ' + data.albums[0] : '앨범 정보 없음';
-  if (sheetSong) sheetSong.textContent = data.sheetSongName && data.songs?.[0]
-    ? data.sheetSongName + ': ' + data.songs[0] : '곡 정보 없음';
-
-  lastLog.textContent = data.lastActionText || '대기 중';
-  summary.textContent = `전체 ${accs.length}계정 | 완료 ${Math.min(cIdx, accs.length)} · 진행 ${data.isRunning ? 1 : 0} (앨범:${albLen}개, 곡:${sonLen}개)`;
-
-  const logs = data.logs || [];
-  if (logBox) {
-    if (logs.length === 0) {
-      logBox.innerHTML = '<span style="color:#888;">기록된 로그가 없습니다.</span>';
-    } else {
-      logBox.innerHTML = logs.map(line => {
-        let color = '#d2dae2';
-        if (line.includes('[SUCCESS]')) color = '#0be881';
-        else if (line.includes('[ERROR]')) color = '#ff5e57';
-        return `<div style="color:${color};">${escapeHtml(line)}</div>`;
-      }).join('');
-      logBox.scrollTop = logBox.scrollHeight;
-    }
-  }
-
-  if (accs.length === 0) {
-    tbody.innerHTML = `<tr><td colspan="5" style="padding:10px;">계정 파일을 불러오세요.</td></tr>`;
-    return;
-  }
-
-  let rowsHtml = '';
-  accs.forEach((acc, i) => {
-    const res = results[acc.id] || { album: '-', song: '-', down: '-' };
-    let albMark = res.album || '-';
-    let sonMark = res.song || '-';
-    let downMark = res.down || '-';
-
-    if (i < cIdx) {
-      if (albMark === '-') albMark = 'x';
-      if (sonMark === '-') sonMark = 'x';
-      if (downMark === '-') downMark = 'x';
-    }
-
-    const bg = i === cIdx ? '#ebf5fb' : (i < cIdx ? '#f9f9f9' : '#ffffff');
-    rowsHtml += `
-      <tr data-idx="${i}" style="background:${bg}; border-bottom:1px solid #eee; cursor:pointer;" title="클릭하면 이 계정부터 시작합니다">
-        <td style="padding:4px; border:1px solid #ddd; font-weight:bold;">${escapeHtml(acc.id)}</td>
-        <td style="padding:4px; border:1px solid #ddd;">${i + 1}</td>
-        <td style="padding:4px; border:1px solid #ddd;">${renderMark(albMark)}</td>
-        <td style="padding:4px; border:1px solid #ddd;">${renderMark(sonMark)}</td>
-        <td style="padding:4px; border:1px solid #ddd;">${renderMark(downMark)}</td>
-      </tr>
-    `;
-  });
-  tbody.innerHTML = rowsHtml;
-
-  const activeRow = tbody.children[cIdx];
-  if (activeRow) {
-    activeRow.scrollIntoView({ block: 'nearest' });
-  }
 }
 
 chrome.storage.onChanged.addListener(updateDashboardUI);
@@ -540,7 +190,8 @@ async function performLikeWithCheck(onComplete) {
     if (!liked) { likeBtn.click(); delay = 1200; }
   }
   await taskDelay(delay);
-  await onComplete(ok, message);
+  if(ok&&likeBtn){ok=likeBtn.classList.contains('on')||likeBtn.classList.contains('active')||likeBtn.parentElement?.classList.contains('on');if(!ok)message='클릭 후 좋아요 상태 미확인';}
+  await onComplete(Boolean(ok), message);
 }
 
 async function claimTaskAction(action, data) {
@@ -628,7 +279,7 @@ async function processTask() {
     createFloatingPanel();
 
     const data = await chrome.storage.local.get([
-      'accounts', 'currentIndex', 'albums', 'songs', 'albumIndex', 'songIndex', 'isRunning', 'step', 'waitRetry', 'runId', 'downloadWaitStartedAt', 'authSequence'
+      'accounts', 'currentIndex', 'albums', 'songs', 'albumIndex', 'songIndex', 'isRunning', 'step', 'waitRetry', 'runId', 'downloadWaitStartedAt', 'authSequence', 'mvs', 'artists'
     ]);
     if (!data.isRunning || !data.accounts || data.accounts.length === 0) {
       isStepRunning = false;
@@ -653,6 +304,18 @@ async function processTask() {
     if (!(await chrome.runtime.sendMessage({action:'AUTH_OWNER'}))?.ok) return;
     if (!(await authCommand('AUTH_ASSERT',data))?.ok) return;
 
+    if(['MV_LIKE','ARTIST_LIKE'].includes(step)){
+      const key=step==='MV_LIKE'?'mv':'artist',sid=key==='mv'?data.mvs?.[0]:data.artists?.[0];
+      const next=key==='mv'&&data.artists?.length?{step:'ARTIST_LIKE',url:'https://www.genie.co.kr/detail/artistInfo?xxnm='+data.artists[0]}:getNextStageUrl('ALBUM_LIKE',data);
+      if(!sid){await chrome.storage.local.set({step:next.step});navigateTask(next.url);return;}
+      const url='https://www.genie.co.kr/detail/'+(key==='mv'?'mediaInfo?xvnm=':'artistInfo?xxnm=')+sid;
+      if(!currentUrl.includes((key==='mv'?'xvnm=':'xxnm=')+sid)){navigateTask(url);return;}
+      if(!await claimTaskAction(step,data))return;
+      await performLikeWithCheck(async(ok,message)=>{if(!await isTaskCurrent(data))return;await updateStepResult(currentAccount.id,key,ok?'o':'x');await saveLog((key==='mv'?'뮤비':'가수')+' 좋아요 '+message,ok?'SUCCESS':'ERROR');await chrome.storage.local.set({step:next.step});navigateTask(next.url);});return;
+    }
+    if(step==='FINISH_ACCOUNT'){
+      await chrome.runtime.sendMessage({action:'FORCE_ROLLOVER',reason:'좋아요 작업 완료',completed:true,expected:{runId:data.runId,currentIndex:data.currentIndex||0,songIndex:data.songIndex||0}});return;
+    }
     // 앨범 좋아요 단계
     if (step === 'ALBUM_LIKE') {
       if (albums && albumIndex < albums.length) {

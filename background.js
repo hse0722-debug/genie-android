@@ -25,10 +25,10 @@ async function digest(text) { return Array.from(new Uint8Array(await crypto.subt
 async function latestBundle() {
   if (fetchInFlight) return fetchInFlight;
   fetchInFlight = (async () => {
-    const response = await fetchText(BASE + 'release.json?refresh=' + Date.now() + '-' + crypto.randomUUID());
+    const response = await fetchText(BASE + 'release-v2.json?refresh=' + Date.now() + '-' + crypto.randomUUID());
     if (!response.ok) throw new Error('최신 버전 조회 실패: HTTP ' + response.status);
     const m = JSON.parse(response.body);
-    if (m.schema !== 1 || m.loaderApi !== 1 || !/^\d+\.\d+\.\d+$/.test(m.version)) throw new Error('실행기와 호환되지 않는 배포 정보입니다.');
+    if (m.schema !== 1 || m.loaderApi !== 2 || !/^\d+\.\d+\.\d+$/.test(m.version)) throw new Error('실행기와 호환되지 않는 배포 정보입니다.');
     const readAsset = async (role, prefix) => {
       const entry = m[role];
       if (!entry || entry.file !== prefix + m.version + '.js' || !/^[a-f0-9]{64}$/.test(entry.sha256)) throw new Error('배포 파일 정보가 올바르지 않습니다.');
@@ -140,7 +140,8 @@ async function rpc(message, sender) {
         }
         return { status: 'ok' };
       }
-      return requestEngine('BUSINESS_REQUEST', { message: msg, sender: { tab: { id: sender.tab.id }, frameId: sender.frameId, url: sender.url } });
+      const preferred=!active.isRunning?[...clients].find(c=>c.ready&&c.engine&&c.bundleId===message.bundleId&&c.sender.tab.id===sender.tab.id):null;
+      return requestEngine('BUSINESS_REQUEST', { message: msg, sender: { tab: { id: sender.tab.id }, frameId: sender.frameId, url: sender.url } },preferred);
     }
     case 'TABS_QUERY': return chrome.tabs.query({ url: '*://*.genie.co.kr/*' });
     case 'TABS_UPDATE': {
@@ -150,6 +151,13 @@ async function rpc(message, sender) {
     }
     case 'TABS_REMOVE': { const tab = await chrome.tabs.get(args[0]); if (genieUrl(tab.url)) await chrome.tabs.remove(args[0]); return null; }
     case 'TABS_CREATE': { if (!genieUrl(args[0]?.url)) throw new Error('지니 주소만 열 수 있습니다.'); return chrome.tabs.create({ url: args[0].url }); }
+    case 'APPS_SCRIPT_FETCH': {
+      const url=new URL(args[0]);
+      if(url.origin!=='https://script.google.com'||!/^\/macros\/s\/[A-Za-z0-9_-]+\/exec$/.test(url.pathname)||url.search||url.hash)throw new Error('Apps Script 웹 앱 /exec 주소를 입력하세요.');
+      const payload=args[1];if(typeof payload!=='string'||payload.length>150000)throw new Error('시트 요청 크기 오류');
+      const controller=new AbortController(),timer=setTimeout(()=>controller.abort(),25000);
+      try{const response=await fetch(url.href,{method:'POST',headers:{'Content-Type':'text/plain;charset=utf-8'},body:payload,credentials:'omit',cache:'no-store',signal:controller.signal});return {ok:response.ok,status:response.status,body:await response.text()};}finally{clearTimeout(timer);}
+    }
     case 'FETCH': {
       const url = new URL(args[0]);
       if (url.protocol !== 'https:' || url.hostname !== 'docs.google.com' || !url.pathname.startsWith('/spreadsheets/')) throw new Error('등록된 시트 주소만 조회할 수 있습니다.');

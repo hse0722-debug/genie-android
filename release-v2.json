@@ -1,0 +1,13 @@
+{
+  "schema": 1,
+  "loaderApi": 2,
+  "version": "10.0.0",
+  "content": {
+    "file": "genie-content-10.0.0.js",
+    "sha256": "60182e672e9aa00456819eac3b5de68d0b94d00ac8d5d4fd25d9f3cd656d9041"
+  },
+  "engine": {
+    "file": "genie-engine-10.0.0.js",
+    "sha256": "f992b48ea1fffbc01d2a8f90a0334daf115e28a60d1b9f22552792bfa2c022ed"
+  }
+}

@@ -1,16 +1,54 @@
 {
   "manifest_version": 3,
   "name": "지니 다운 도우미 자동 업데이트 실행기",
-  "version": "9.0.0",
+  "version": "10.0.0",
   "minimum_chrome_version": "120",
   "description": "최신 작업 코드를 불러오는 PC·Android 공용 실행기. 결제·다운로드와 계정 전환 지원.",
-  "permissions": ["storage", "tabs", "downloads", "userScripts"],
-  "host_permissions": ["*://*.genie.co.kr/*", "https://docs.google.com/*", "https://*.googleusercontent.com/*", "https://raw.githubusercontent.com/*"],
-  "action": {"default_icon": "icon.png"},
-  "icons": {"16": "icon.png", "48": "icon.png", "128": "icon.png"},
-  "background": {"service_worker": "background.js"},
+  "permissions": [
+    "storage",
+    "tabs",
+    "downloads",
+    "userScripts"
+  ],
+  "host_permissions": [
+    "*://*.genie.co.kr/*",
+    "https://docs.google.com/*",
+    "https://*.googleusercontent.com/*",
+    "https://raw.githubusercontent.com/*",
+    "https://script.google.com/*"
+  ],
+  "action": {
+    "default_icon": "icon.png"
+  },
+  "icons": {
+    "16": "icon.png",
+    "48": "icon.png",
+    "128": "icon.png"
+  },
+  "background": {
+    "service_worker": "background.js"
+  },
   "content_scripts": [
-    {"matches": ["*://*.genie.co.kr/*"], "js": ["alert_blocker.js"], "run_at": "document_start", "world": "MAIN", "all_frames": true},
-    {"matches": ["*://*.genie.co.kr/*"], "js": ["launcher.js"], "run_at": "document_idle", "all_frames": true}
+    {
+      "matches": [
+        "*://*.genie.co.kr/*"
+      ],
+      "js": [
+        "alert_blocker.js"
+      ],
+      "run_at": "document_start",
+      "world": "MAIN",
+      "all_frames": true
+    },
+    {
+      "matches": [
+        "*://*.genie.co.kr/*"
+      ],
+      "js": [
+        "launcher.js"
+      ],
+      "run_at": "document_idle",
+      "all_frames": true
+    }
   ]
 }
