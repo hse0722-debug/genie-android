@@ -25,6 +25,7 @@ async function appendLog(type, text) {
 
 // content.js와 메시지 통신
 chrome.runtime.onMessage.addListener((msg, sender, sendResponse) => {
+  if(msg.action==='SKIP_ACCOUNT'){withStateLock(()=>skipAccount(msg.expected,sender)).then(sendResponse,error=>sendResponse({ok:false,error:error.message}));return true;}
   if(msg.action?.startsWith('SHEET_')){const operation=msg.action==='SHEET_SYNC'?sheetCommand(msg):withStateLock(()=>sheetCommand(msg));operation.then(value=>sendResponse({ok:true,...value}),error=>sendResponse({ok:false,error:error.message}));return true;}
   if (msg.action?.startsWith('AUTH_')) {
     accountAuthRequest(msg,sender).then(sendResponse,error=>sendResponse({ok:false,error:error.message}));return true;
@@ -58,8 +59,8 @@ chrome.runtime.onMessage.addListener((msg, sender, sendResponse) => {
 // 다운로드 이벤트가 겹쳐도 한 곡의 결과와 계정 전환은 한 번만 처리합니다.
 chrome.downloads.onCreated.addListener(async (downloadItem) => {
   const data = await withStateLock(async () => {
-    const current = await chrome.storage.local.get(['isRunning', 'step', 'songs', 'songIndex', 'accounts', 'currentIndex', 'accountResults', 'runId', 'verifiedSession', 'downloadEventId', 'downloadReceivedAt', 'logs']);
-    if (!current.isRunning || !verifiedFor(current) || (downloadItem.expected && !sameTask(current, downloadItem.expected))) return null;
+    const current = await chrome.storage.local.get(['isRunning', 'step', 'songs', 'songIndex', 'accounts', 'currentIndex', 'accountResults', 'runId', 'verifiedSession', 'skipRequested', 'downloadEventId', 'downloadReceivedAt', 'logs']);
+    if (!current.isRunning || skipMatchesAccount(current) || !verifiedFor(current) || (downloadItem.expected && !sameTask(current, downloadItem.expected))) return null;
     const replay = current.step === 'DOWNLOAD_RECEIVED' && current.downloadEventId === downloadItem.id;
     if (!replay && !downloadSteps.includes(current.step)) return null;
     const index = current.songIndex || 0;
@@ -136,6 +137,7 @@ async function performAccountRollover(reason, isError, expected) {
   const data = await chrome.storage.local.get(['isRunning', 'accounts', 'currentIndex', 'accountResults', 'runId', 'songIndex', 'step', 'verifiedSession', 'albums', 'songs', 'mvs', 'artists']);
   if (!expected || !sameTask(data, expected) || data.step === 'ACCOUNT_ROLLOVER') return;
   await closePaymentPopups();
+  const latest=await chrome.storage.local.get(['isRunning','runId','currentIndex','songIndex']);if(!sameTask(latest,data))return;
 
   const accounts = data.accounts || [];
   const currentAccount = accounts[data.currentIndex];
@@ -229,10 +231,10 @@ async function claimTaskAction(action, expected) {
   };
   if (!expected || !allowedSteps[action]) return false;
   return withStateLock(async () => {
-    const current = await chrome.storage.local.get(['isRunning', 'runId', 'currentIndex', 'songIndex', 'albumIndex', 'step', 'actionClaims', 'accounts', 'verifiedSession']);
-    if (!sameTask(current, expected) || (current.albumIndex || 0) !== (expected.albumIndex || 0) ||
+    const current = await chrome.storage.local.get(['isRunning', 'runId', 'currentIndex', 'songIndex', 'albumIndex', 'step', 'actionClaims', 'accounts', 'verifiedSession', 'skipRequested']);
+    if (skipMatchesAccount(current) || !sameTask(current, expected) || (current.albumIndex || 0) !== (expected.albumIndex || 0) ||
         !allowedSteps[action].includes(current.step)) return false;
-    if (['MV_LIKE','ARTIST_LIKE','ALBUM_LIKE','SONG_LIKE','PAY_SONG','PAY_FINAL'].includes(action) && !await assertVerifiedSession(current)) return false;
+    if (['MV_LIKE','ARTIST_LIKE','ALBUM_LIKE','SONG_LIKE','PAY_SONG','PAY_FINAL'].includes(action) && (!await assertAccountLease(current)||!await assertVerifiedSession(current))) return false;
     const key = [current.runId || 'legacy', current.currentIndex || 0, current.albumIndex || 0, current.songIndex || 0, action].join(':');
     const claims = current.actionClaims || {}, previous = claims[key];
     const cooldown = action === 'LOGIN' ? 10000 : action === 'OPEN_LOGIN' ? 7000 : Infinity;
@@ -278,8 +280,8 @@ async function assertVerifiedSession(data) {
   if (!verifiedFor(data)) { await stopAccountAuth('현재 계정의 로그인 확인 기록이 없습니다',data); return false; }
   try {
     const session=await readServerSession();
-    const now=await chrome.storage.local.get(['isRunning','runId','currentIndex','songIndex','step']);
-    if(!sameTask(now,data)||now.step!==data.step)return false;
+    const now=await chrome.storage.local.get(['isRunning','runId','currentIndex','songIndex','step','skipRequested']);
+    if(skipMatchesAccount(now)||!sameTask(now,data)||now.step!==data.step)return false;
     if (session.loggedIn && session.memberNo===data.verifiedSession.memberNo) return true;
     await stopAccountAuth('확인한 계정의 로그인 세션이 변경되었거나 로그아웃되었습니다',data);
   } catch(error) { await stopAccountAuth(error.message,data); }
@@ -288,13 +290,15 @@ async function assertVerifiedSession(data) {
 const authLogoutUrl='https://www.genie.co.kr/auth/signOut?rfr='+encodeURIComponent('https://www.genie.co.kr/');
 const authLoginUrl='https://www.genie.co.kr/member/popLogin?page_rfr='+encodeURIComponent('https://www.genie.co.kr/');
 async function accountAuthRequest(msg,sender) {
+  if(msg.action==='AUTH_OWNER'){const d=await chrome.storage.local.get(['mainTabId']);return {ok:sender.frameId===0&&sender.tab?.id===d.mainTabId};}
   return withStateLock(async()=>{
     const data=await chrome.storage.local.get(['isRunning','runId','currentIndex','songIndex','accounts','albums','songs','mvs','artists','step','mainTabId','verifiedSession','previousSession','authSequence','accountMemberBindings']);
     if (msg.action==='AUTH_OWNER') return {ok:sender.frameId===0 && sender.tab?.id===data.mainTabId};
     if (!msg.expected || !sameTask(data,msg.expected)) return {ok:false};
     if (msg.action==='AUTH_ASSERT') return {ok:await assertVerifiedSession(data)};
+    if (msg.action==='AUTH_FINAL_GUARD') return {ok:await assertAccountLease(data)&&await assertVerifiedSession(data)};
     if (sender.frameId!==0 || sender.tab?.id!==data.mainTabId) return {ok:false};
-    const probe=async()=>{const session=await readServerSession();const now=await chrome.storage.local.get(['isRunning','runId','currentIndex','songIndex','step']);if(!sameTask(now,data)||now.step!==data.step){const error=new Error('stale auth');error.stale=true;throw error;}return session;};
+    const probe=async()=>{const session=await readServerSession();const now=await chrome.storage.local.get(['isRunning','runId','currentIndex','songIndex','step','skipRequested']);if(skipMatchesAccount(now)||!sameTask(now,data)||now.step!==data.step){const error=new Error('stale auth');error.stale=true;throw error;}return session;};
     const account=data.accounts?.[data.currentIndex||0]; if(!account)return stopAccountAuth('대상 계정이 없습니다',data);
     try {
       if(msg.action==='AUTH_BEGIN') {
@@ -350,7 +354,20 @@ async function accountAuthRequest(msg,sender) {
 function accountSheetRef(value){let u;try{u=new URL(String(value).trim());}catch{throw Error('계정 시트 주소를 입력하세요.');}const id=u.pathname.match(/^\/spreadsheets\/d\/([\w-]+)\//)?.[1];const gid=u.searchParams.get('gid')||new URLSearchParams(u.hash.slice(1)).get('gid');if(u.hostname!=='docs.google.com'||!id||!/^\d+$/.test(gid||''))throw Error('탭의 gid가 포함된 Google 시트 주소를 입력하세요.');return {spreadsheetId:id,gid:Number(gid)};}
 async function sheetApi(action,extra={}){const d=await chrome.storage.local.get(['sheetConfig']);const c=d.sheetConfig;if(!c?.endpoint)throw Error('연결 설정에서 웹 앱 주소를 저장하세요.');if(!/^https:\/\/script\.google\.com\/macros\/s\/[\w-]+\/exec$/.test(c.endpoint))throw Error('Apps Script /exec 주소를 입력하세요.');const r=await fetch(c.endpoint,{method:'POST',body:JSON.stringify({action,...extra})});if(!r.ok)throw Error('시트 서버 응답 오류 ('+r.status+')');let result;try{result=await r.json();}catch{throw Error('웹 앱 응답을 확인하세요. 접근 권한은 모든 사용자, 실행 사용자는 나로 배포해야 합니다.');}if(!result.ok)throw Error(result.error||'시트 요청 실패');return result;}
 async function getSheetSeeds(){const result=await sheetApi('seeds');const s=result.seeds;return {albumName:s.album.name,albumSid:s.album.sid,songName:s.song.name,songSid:s.song.sid,mvName:s.mv.name,mvSid:s.mv.sid,artistName:s.artist.name,artistSid:s.artist.sid};}
-async function sheetCommand(msg){const d=await chrome.storage.local.get(['isRunning','accounts','accountResults','sheetContext','sheetSynced','sheetConfig','albums','songs','mvs','artists']);if(msg.action==='SHEET_SYNC')return sheetTick();if(['SHEET_IMPORT','SHEET_START','SHEET_PREPARE_CHANGE'].includes(msg.action)){if(sheetTickBusy)throw Error('시트 기록 처리 중입니다. 잠시 후 다시 시도하세요.');const sync=await sheetTick();const pending=(await chrome.storage.local.get(['sheetPending'])).sheetPending;if(!sync.ok||pending)throw Error('이전 결과의 시트 기록을 먼저 완료하세요.');if(msg.action==='SHEET_PREPARE_CHANGE')return {ok:true};}if(['SHEET_CATALOG','SHEET_IMPORT','SHEET_START'].includes(msg.action)&&d.isRunning)throw Error('작업을 중단한 뒤 변경하세요.');if(msg.action==='SHEET_CATALOG'){const source=accountSheetRef(msg.url),result=await sheetApi('catalog',source);await chrome.storage.local.set({sheetCatalog:{...result,...source,url:msg.url},sheetSelection:null});return result;}if(msg.action==='SHEET_IMPORT'){const source=accountSheetRef(msg.url),result=await sheetApi('accounts',{...source,helper:msg.helper,time:msg.time});if(!result.accounts.length)throw Error('선택 범위에 J열 비밀번호가 있는 계정이 없습니다.');if(result.accounts.some(r=>typeof r.password!=='string'||!r.password.length))throw Error('Apps Script의 새 Code.gs를 저장하고 새 버전으로 배포하세요.');const accounts=result.accounts.map(r=>({id:r.id,pw:r.password,row:r.row}));await chrome.storage.local.set({accounts,accountResults:{},currentIndex:0,albumIndex:0,songIndex:0,step:'CHECK_OR_LOGIN',sheetSynced:{},sheetContext:null,sheetSelection:{...source,helper:msg.helper,time:msg.time,credentialMode:'row-password'},sheetSyncError:'',sheetExcluded:result.excluded});return result;}if(msg.action==='SHEET_START'){if(![d.albums,d.songs,d.mvs,d.artists].some(x=>x?.length))throw Error('시드 시트에 작업 대상을 하나 이상 입력하세요.');const selection=(await chrome.storage.local.get(['sheetSelection'])).sheetSelection;if(!selection||!d.accounts?.length)throw Error('계정을 먼저 불러오세요.');if(selection.credentialMode!=='row-password')throw Error('J열 비밀번호 방식으로 계정을 다시 불러오세요.');const fresh=await sheetApi('accounts',selection);const accounts=d.accounts.map(a=>{const latest=fresh.accounts.find(r=>r.id===a.id);if(!latest)throw Error('계정 배정 또는 J열이 변경되었습니다. 다시 불러오세요.');if(typeof latest.password!=='string'||!latest.password.length)throw Error('J열 비밀번호가 비어 있습니다.');return {...a,pw:latest.password,row:latest.row};});const runId=crypto.randomUUID(),context={...selection,jobId:runId,accounts:accounts.map(a=>a.id)};await sheetApi('claim',context);await chrome.storage.local.set({accounts,sheetContext:context,sheetSynced:{},accountResults:{},sheetSyncError:'',isRunning:true,runId,actionClaims:{},verifiedSession:null,authSequence:null,step:'CHECK_OR_LOGIN',currentIndex:0,albumIndex:0,songIndex:0,waitRetry:0});return {runId};}throw Error('지원하지 않는 시트 요청');}
+async function sheetCommand(msg){const d=await chrome.storage.local.get(['isRunning','currentIndex','accounts','accountResults','sheetContext','sheetSynced','sheetConfig','albums','songs','mvs','artists']);if(msg.action==='SHEET_SYNC')return sheetTick();if(['SHEET_IMPORT','SHEET_START','SHEET_PREPARE_CHANGE'].includes(msg.action)){if(sheetTickBusy)throw Error('시트 기록 처리 중입니다. 잠시 후 다시 시도하세요.');const sync=await sheetTick();const pending=(await chrome.storage.local.get(['sheetPending'])).sheetPending;if(!sync.ok||pending)throw Error('이전 결과의 시트 기록을 먼저 완료하세요.');if(msg.action==='SHEET_PREPARE_CHANGE')return {ok:true};}if(['SHEET_CATALOG','SHEET_IMPORT','SHEET_START'].includes(msg.action)&&d.isRunning)throw Error('작업을 중단한 뒤 변경하세요.');if(msg.action==='SHEET_CATALOG'){const source=accountSheetRef(msg.url),result=await sheetApi('catalog',source);await chrome.storage.local.set({sheetCatalog:{...result,...source,url:msg.url},sheetSelection:null});return result;}if(msg.action==='SHEET_IMPORT'){const source=accountSheetRef(msg.url),result=await sheetApi('accounts',{...source,helper:msg.helper,time:msg.time});if(!result.accounts.length)throw Error('선택 범위에 J열 비밀번호가 있는 계정이 없습니다.');if(result.accounts.some(r=>typeof r.password!=='string'||!r.password.length))throw Error('Apps Script의 새 Code.gs를 저장하고 새 버전으로 배포하세요.');const accounts=result.accounts.map(r=>({id:r.id,pw:r.password,row:r.row}));await chrome.storage.local.set({accounts,accountResults:{},currentIndex:0,albumIndex:0,songIndex:0,step:'CHECK_OR_LOGIN',sheetSynced:{},sheetContext:null,sheetSelection:{...source,helper:msg.helper,time:msg.time,credentialMode:'row-password'},sheetSyncError:'',sheetExcluded:result.excluded});return result;}if(msg.action==='SHEET_START'){if(![d.albums,d.songs,d.mvs,d.artists].some(x=>x?.length))throw Error('시드 시트에 작업 대상을 하나 이상 입력하세요.');const selection=(await chrome.storage.local.get(['sheetSelection'])).sheetSelection;if(!selection||!d.accounts?.length)throw Error('계정을 먼저 불러오세요.');if(selection.credentialMode!=='row-password')throw Error('J열 비밀번호 방식으로 계정을 다시 불러오세요.');const fresh=await sheetApi('accounts',selection);const accounts=d.accounts.map(a=>{const latest=fresh.accounts.find(r=>r.id===a.id);if(!latest)throw Error('계정 배정 또는 J열이 변경되었습니다. 다시 불러오세요.');if(typeof latest.password!=='string'||!latest.password.length)throw Error('J열 비밀번호가 비어 있습니다.');return {...a,pw:latest.password,row:latest.row};});const runId=crypto.randomUUID(),context={...selection,jobId:runId,accounts:accounts.map(a=>a.id)};await sheetApi('claim',context);await chrome.storage.local.set({accounts,sheetContext:context,sheetSynced:{},accountResults:{},sheetSyncError:'',isRunning:true,runId,actionClaims:{},verifiedSession:null,authSequence:null,step:'CHECK_OR_LOGIN',currentIndex:(d.currentIndex||0)<accounts.length?(d.currentIndex||0):0,skipRequested:null,albumIndex:0,songIndex:0,waitRetry:0});return {runId};}throw Error('지원하지 않는 시트 요청');}
 let sheetTickBusy=false;
 async function sheetTick(){if(sheetTickBusy)return {ok:true};sheetTickBusy=true;try{const d=await chrome.storage.local.get(['sheetContext','accountResults','sheetSynced','isRunning','albums','songs','mvs','artists']);if(!d.sheetContext)return {ok:true};const enabled={album:d.albums?.length,song:d.songs?.length,down:d.songs?.length,mv:d.mvs?.length,artist:d.artists?.length};const synced=d.sheetSynced||{},changes=[];for(const id of d.sheetContext.accounts)for(const metric of ['down','song','mv','album','artist']){const value=d.accountResults?.[id]?.[metric],key=id+':'+metric;if(enabled[metric]&&['o','x'].includes(value)&&synced[key]!==value)changes.push({id,metric,value});}if(d.isRunning)await sheetApi('heartbeat',d.sheetContext);if(changes.length){const batch=changes.slice(0,100);await sheetApi('write',{...d.sheetContext,changes:batch});for(const c of batch)synced[c.id+':'+c.metric]=c.value;await chrome.storage.local.set({sheetSynced:synced,sheetSyncError:'',sheetPending:Math.max(0,changes.length-100)});}else{await chrome.storage.local.set({sheetSyncError:'',sheetPending:0});if(!d.isRunning)await sheetApi('release',d.sheetContext);}return {ok:true};}catch(error){await chrome.storage.local.set({sheetSyncError:error.message});return {ok:false,error:error.message};}finally{sheetTickBusy=false;}}
 setInterval(()=>sheetTick(),15000);
+
+function skipMatchesAccount(data){const request=data.skipRequested;return Boolean(request&&request.runId===data.runId&&(request.currentIndex||0)===(data.currentIndex||0));}
+async function skipAccount(expected,sender){
+ const data=await chrome.storage.local.get(['isRunning','runId','currentIndex','songIndex','accounts','mainTabId','accountResults','albums','songs','mvs','artists']);
+ if(!expected||data.runId!==expected.runId||(data.currentIndex||0)!==(expected.currentIndex||0))return {ok:false,error:'현재 계정이 바뀌었습니다. 확인 후 다시 시도하세요.'};
+ if(sender.frameId!==0||(data.isRunning&&sender.tab?.id!==data.mainTabId))return {ok:false,error:'메인 리모컨에서 넘겨주세요.'};
+ const account=data.accounts?.[data.currentIndex||0];if(!account)return {ok:false,error:'넘길 계정이 없습니다.'};
+ if(data.isRunning){await chrome.storage.local.set({step:'SKIP_ACCOUNT_PENDING'});await performAccountRollover('사용자 ▷ 넘기기',true,data);}
+ else{const results=data.accountResults||{};results[account.id]||={};for(const metric of ['album','song','down','mv','artist']){const enabled={album:data.albums?.length,song:data.songs?.length,down:data.songs?.length,mv:data.mvs?.length,artist:data.artists?.length}[metric];if(enabled&&!['o','x'].includes(results[account.id][metric]))results[account.id][metric]='x';}await chrome.storage.local.set({accountResults:results,currentIndex:(data.currentIndex||0)+1,albumIndex:0,songIndex:0,step:'CHECK_OR_LOGIN',verifiedSession:null,authSequence:null});await appendLog('INFO','▷ '+account.id+' 계정 넘기기 · 다음 시작 위치 저장');}
+ return {ok:true};
+}
+
+async function assertAccountLease(data){const context=(await chrome.storage.local.get(['sheetContext'])).sheetContext;if(!context)return true;try{await sheetApi('heartbeat',{...context,accounts:[data.accounts?.[data.currentIndex||0]?.id]});return true;}catch(error){await stopAccountAuth('계정 사용 잠금 확인 실패: '+error.message,data);return false;}}
