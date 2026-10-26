@@ -94,7 +94,7 @@ async function loadSheetSeeds() {
       ...(changed ? { step: 'CHECK_OR_LOGIN', albumIndex: 0, songIndex: 0 } : {})
     });
     await updateDashboardUI();
-    if (status) status.textContent = '구글 시트 고정값 · 시작할 때 최신 값 확인';
+    if (status) status.textContent = '';
     return true;
   } catch (err) {
     if (status) status.textContent = '시트 로드 실패: ' + err.message;
@@ -290,7 +290,7 @@ async function createFloatingPanel() {
 
   document.getElementById('btn-resume').onclick = async () => {
     const startBtn = document.getElementById('btn-resume');
-    if (startBtn.disabled) return;
+    if (startBtn.disabled || navigationPending) return;
     startBtn.disabled = true;
     let loaded;
     try { loaded = await loadSheetSeeds(); }
@@ -309,13 +309,17 @@ async function createFloatingPanel() {
 
     chrome.runtime.sendMessage({ action: 'REGISTER_MAIN_TAB' }).catch(() => {});
 
-    const step = (data.step && data.step !== 'IDLE') ? data.step : 'CHECK_OR_LOGIN';
+    const pausedDownload = ['SONG_DOWNLOAD', 'PAY_POPUP_STEP1', 'WAIT_DOWNLOAD_STREAM', 'DOWNLOAD_RECEIVED'].includes(data.step);
+    const step = pausedDownload ? 'SONG_LIKE' : (data.step && !['IDLE', 'ACCOUNT_ROLLOVER'].includes(data.step)) ? data.step : 'CHECK_OR_LOGIN';
     const cIdx = data.currentIndex || 0;
     const albIdx = data.albumIndex || 0;
     const sIdx = data.songIndex || 0;
 
     await chrome.storage.local.set({
       isRunning: true,
+      runId: crypto.randomUUID(),
+      actionClaims: {},
+      downloadWaitStartedAt: 0,
       step,
       currentIndex: cIdx,
       albumIndex: albIdx,
@@ -334,7 +338,7 @@ async function createFloatingPanel() {
       targetUrl = getUrl('song', data.songs[sIdx] || data.songs[0]);
     }
 
-    window.location.href = targetUrl;
+    navigateTask(targetUrl);
   };
 
   document.getElementById('btn-stop').onclick = async () => {
@@ -519,44 +523,109 @@ function setInputValue(el, val) {
   el.dispatchEvent(new Event('change', { bubbles: true }));
 }
 
-function performLikeWithCheck(onComplete) {
+const taskDelay = ms => new Promise(resolve => setTimeout(resolve, ms));
+
+async function performLikeWithCheck(onComplete) {
   const countEl = document.querySelector('#emLikeCount');
-  const likeBtn =
-    (countEl && countEl.closest('a, button')) ||
-    document.querySelector('a.btn-like') ||
-    document.querySelector('a[onclick*="like"]');
-
+  const likeBtn = (countEl && countEl.closest('a, button')) ||
+    document.querySelector('a.btn-like') || document.querySelector('a[onclick*="like"]');
+  let ok = false, message = '좋아요 버튼 없음', delay = 700;
   if (likeBtn) {
-    const isAlreadyLiked =
-      likeBtn.classList.contains('on') ||
-      likeBtn.classList.contains('active') ||
-      (likeBtn.parentElement && likeBtn.parentElement.classList.contains('on'));
-
-    if (isAlreadyLiked) {
-      // 딜레이 0.3초 증가
-      setTimeout(() => onComplete(true, '이미 좋아요 상태(스킵)'), 700);
-    } else {
-      likeBtn.click();
-      // 딜레이 0.3초 증가
-      setTimeout(() => onComplete(true, '좋아요 클릭 성공'), 1200);
-    }
-  } else {
-    // 딜레이 0.3초 증가
-    setTimeout(() => onComplete(false, '좋아요 버튼 없음'), 700);
+    ok = true;
+    const liked = likeBtn.classList.contains('on') || likeBtn.classList.contains('active') ||
+      likeBtn.parentElement?.classList.contains('on');
+    message = liked ? '이미 좋아요 상태(스킵)' : '좋아요 클릭 성공';
+    if (!liked) { likeBtn.click(); delay = 1200; }
   }
+  await taskDelay(delay);
+  await onComplete(ok, message);
+}
+
+async function claimTaskAction(action, data) {
+  const reply = await chrome.runtime.sendMessage({ action: 'CLAIM_TASK_ACTION', taskAction: action,
+    expected: { runId: data.runId, currentIndex: data.currentIndex || 0,
+      albumIndex: data.albumIndex || 0, songIndex: data.songIndex || 0 } });
+  return reply?.granted === true;
+}
+
+async function isTaskCurrent(data, allowedSteps) {
+  const now = await chrome.storage.local.get(['isRunning', 'runId', 'currentIndex', 'albumIndex', 'songIndex', 'step']);
+  return now.isRunning && now.runId === data.runId &&
+    (now.currentIndex || 0) === (data.currentIndex || 0) &&
+    (now.albumIndex || 0) === (data.albumIndex || 0) &&
+    (now.songIndex || 0) === (data.songIndex || 0) &&
+    !['DOWNLOAD_RECEIVED', 'ACCOUNT_ROLLOVER'].includes(now.step) &&
+    (!allowedSteps || allowedSteps.includes(now.step));
+}
+
+function actionable(el) {
+  return Boolean(el && el.getClientRects().length && !el.disabled && el.getAttribute('aria-disabled') !== 'true');
+}
+
+// 결제창은 앞으로만 진행합니다. 버튼 클릭 후 동일 함수를 다시 호출하지 않습니다.
+async function handlePayment(data) {
+  if (!['SONG_DOWNLOAD', 'PAY_POPUP_STEP1', 'WAIT_DOWNLOAD_STREAM'].includes(data.step)) return false;
+  if (data.step === 'WAIT_DOWNLOAD_STREAM') return false;
+  const cash = document.querySelector('input#name-genie[name="selectPay"][value="8"], #name-genie');
+  const agree = document.querySelector('input#name-agree');
+  const purchase = document.querySelector('input#name-payment');
+  const finalSelector = 'a.def-btn.radius.btn-blue[onclick*="fnCashPay"], a[onclick*="fnCashPay"]';
+  const final = document.querySelector(finalSelector);
+  const controls = [cash, agree, purchase].filter(actionable);
+  if (controls.length || actionable(final)) {
+    let changed = false;
+    for (const control of controls) {
+      if (!control.checked) { control.click(); changed = true; }
+    }
+    if (changed) await saveLog('[결제 2~4단계] 지니캐시 선택 및 약관·구매 동의 체크', 'INFO');
+    const button = document.querySelector(finalSelector);
+    if (controls.some(el => !el.checked) || !actionable(button)) return false;
+    if (!await claimTaskAction('PAY_FINAL', data)) return false;
+    // 기존 최종 결제 전 대기시간을 유지하고, 중단/계정 변경 시 클릭하지 않습니다.
+    await taskDelay(900);
+    if (!await isTaskCurrent(data)) return true;
+    const readyButton = document.querySelector(finalSelector);
+    const currentControls = [
+      document.querySelector('input#name-genie[name="selectPay"][value="8"], #name-genie'),
+      document.querySelector('input#name-agree'), document.querySelector('input#name-payment')
+    ].filter(actionable);
+    if (!actionable(readyButton) || currentControls.some(el => !el.checked)) {
+      await chrome.storage.local.set({ isRunning: false });
+      await saveLog('결제 화면이 변경되어 중단했습니다. 화면 확인 후 다시 시작해주세요.', 'ERROR');
+      return true;
+    }
+    await saveLog('[결제 최종단계] "결제하기" 버튼 1회 클릭 → 다운로드 대기', 'INFO');
+    if (await isTaskCurrent(data, ['WAIT_DOWNLOAD_STREAM'])) readyButton.click();
+    return true;
+  }
+  const first = document.querySelector('#btnPaySong');
+  if (data.step === 'SONG_DOWNLOAD' && actionable(first) && await claimTaskAction('PAY_SONG', data)) {
+    if (!await isTaskCurrent(data, ['PAY_POPUP_STEP1'])) return true;
+    await saveLog('[결제 1단계] 개별 곡 결제하기 버튼 1회 클릭', 'INFO');
+    if (await isTaskCurrent(data, ['PAY_POPUP_STEP1'])) first.click();
+    return true;
+  }
+  return false;
+}
+
+let navigationPending = false;
+function navigateTask(url, replace = false) {
+  navigationPending = true;
+  if (replace) window.location.replace(url);
+  else window.location.href = url;
 }
 
 let isStepRunning = false;
 
 async function processTask() {
-  if (isStepRunning) return;
+  if (isStepRunning || navigationPending) return;
   isStepRunning = true;
 
   try {
     createFloatingPanel();
 
     const data = await chrome.storage.local.get([
-      'accounts', 'currentIndex', 'albums', 'songs', 'albumIndex', 'songIndex', 'isRunning', 'step', 'waitRetry'
+      'accounts', 'currentIndex', 'albums', 'songs', 'albumIndex', 'songIndex', 'isRunning', 'step', 'waitRetry', 'runId', 'downloadWaitStartedAt'
     ]);
     if (!data.isRunning || !data.accounts || data.accounts.length === 0) {
       isStepRunning = false;
@@ -571,72 +640,17 @@ async function processTask() {
       return;
     }
 
+    if (['DOWNLOAD_RECEIVED', 'ACCOUNT_ROLLOVER'].includes(step)) return;
     const currentAccount = accounts[currentIndex];
     const currentUrl = window.location.href;
 
-    const btnPaySong1 = document.querySelector('#btnPaySong');
-    const radioGenieCash = document.querySelector('input#name-genie[name="selectPay"][value="8"], #name-genie');
-    const chkAgree = document.querySelector('input#name-agree');
-    const chkPayment = document.querySelector('input#name-payment');
-    const btnFinalPay = document.querySelector('a.def-btn.radius.btn-blue[onclick*="fnCashPay"]') || document.querySelector('a[onclick*="fnCashPay"]');
-
-    if (btnPaySong1 || radioGenieCash || btnFinalPay) {
-      if (btnPaySong1 && btnPaySong1.offsetParent !== null && (!radioGenieCash || radioGenieCash.offsetParent === null)) {
-        if (step !== 'PAY_POPUP_STEP1') {
-          await chrome.storage.local.set({ step: 'PAY_POPUP_STEP1', waitRetry: 0 });
-          await saveLog('[다운로드/결제] 개별 곡 결제하기(#btnPaySong) 클릭', 'INFO');
-          btnPaySong1.click();
-          callPageFunction('fnMp3Buy');
-        }
-        isStepRunning = false;
-        return;
-      }
-
-      if (radioGenieCash || chkAgree || chkPayment || btnFinalPay) {
-        if (step !== 'WAIT_DOWNLOAD_STREAM') {
-          await chrome.storage.local.set({ step: 'WAIT_DOWNLOAD_STREAM', waitRetry: 0 });
-
-          if (radioGenieCash && !radioGenieCash.checked) {
-            radioGenieCash.click();
-            radioGenieCash.checked = true;
-            radioGenieCash.dispatchEvent(new Event('change', { bubbles: true }));
-          }
-          if (chkAgree && !chkAgree.checked) {
-            chkAgree.click();
-            chkAgree.checked = true;
-            chkAgree.dispatchEvent(new Event('change', { bubbles: true }));
-          }
-          if (chkPayment && !chkPayment.checked) {
-            chkPayment.click();
-            chkPayment.checked = true;
-            chkPayment.dispatchEvent(new Event('change', { bubbles: true }));
-          }
-
-          await saveLog('[결제 2~4단계] 지니캐시 선택 및 약관 동의 체크 완료', 'INFO');
-
-          // 딜레이 0.3초 증가 (600 -> 900)
-          setTimeout(async () => {
-            const finalBtn = document.querySelector('a.def-btn.radius.btn-blue[onclick*="fnCashPay"]') || document.querySelector('a[onclick*="fnCashPay"]') || btnFinalPay;
-            if (finalBtn && !finalBtn.dataset.clicked) {
-              finalBtn.dataset.clicked = "true";
-              await saveLog('[결제 최종단계] "결제하기" 버튼(fnCashPay) 클릭 완료 -> 다운로드 대기', 'SUCCESS');
-              finalBtn.click();
-              callPageFunction('fnCashPay');
-            } else if (!finalBtn) {
-              await saveLog('❌ 최종 결제하기 버튼(fnCashPay)을 찾을 수 없습니다.', 'ERROR');
-            }
-          }, 900);
-        }
-        isStepRunning = false;
-        return;
-      }
-    }
+    if (await handlePayment(data)) return;
 
     // 비밀번호 변경 캠페인(myInfoPwdChangeMsg) 추가 
     if (currentUrl.includes('popLoginSuccess') || currentUrl.toLowerCase().includes('loginsuccess') || currentUrl.includes('myInfoPwdChangeMsg')) {
       const next = getNextStageUrl('ALBUM_LIKE', data);
       await chrome.storage.local.set({ step: next.step, waitRetry: 0 });
-      window.location.replace(next.url);
+      navigateTask(next.url, true);
       isStepRunning = false;
       return;
     }
@@ -654,6 +668,7 @@ async function processTask() {
 
     if (currentUrl.includes('/member/popLogin') || currentUrl.includes('/member/login') || (idInput && pwInput && idInput.offsetParent !== null)) {
       if (document.body && (document.body.innerText.includes('일치하지 않습니다') || document.body.innerText.includes('다시 확인해주세요'))) {
+        if (!await claimTaskAction('LOGIN_FAILURE', data)) return;
         await saveLog(`❌ ${currentAccount.id} - 로그인 실패(아이디/비번 오류 스킵)`, 'ERROR');
         await updateStepResult(currentAccount.id, 'album', 'x');
         await updateStepResult(currentAccount.id, 'song', 'x');
@@ -665,12 +680,13 @@ async function processTask() {
           albumIndex: 0,
           songIndex: 0
         });
-        window.location.href = "https://www.genie.co.kr/member/popLogin?page_rfr=" + encodeURIComponent(nextStage.url);
+        navigateTask("https://www.genie.co.kr/member/popLogin?page_rfr=" + encodeURIComponent(nextStage.url));
         isStepRunning = false;
         return;
       }
 
       if (idInput && pwInput) {
+        if (!await claimTaskAction('LOGIN', data)) return;
         setInputValue(idInput, currentAccount.id);
         setInputValue(pwInput, currentAccount.pw);
 
@@ -687,7 +703,9 @@ async function processTask() {
         await saveLog(`🔑 로그인 시도 중 (${currentAccount.id})`, 'INFO');
 
         // 딜레이 0.3초 증가 (600 -> 900)
-        setTimeout(() => {
+        await taskDelay(900);
+        if (!await isTaskCurrent(data)) return;
+        {
           const loginBtn =
             document.querySelector('input.btn-submit[value="로그인"]') ||
             document.querySelector('input.btn-submit') ||
@@ -696,9 +714,10 @@ async function processTask() {
             document.querySelector('.btn-login');
           if (loginBtn) {
             loginBtn.click();
+          } else {
+            callPageFunction('loginID');
           }
-          callPageFunction('loginID');
-        }, 900);
+        }
         isStepRunning = false;
         return;
       }
@@ -713,11 +732,12 @@ async function processTask() {
       if (isUserLoggedIn()) {
         const next = getNextStageUrl('ALBUM_LIKE', data);
         await chrome.storage.local.set({ step: next.step, waitRetry: 0 });
-        window.location.href = next.url;
+        navigateTask(next.url);
         isStepRunning = false;
         return;
       }
 
+      if (!await claimTaskAction('OPEN_LOGIN', data)) return;
       const genieLoginBtn = document.querySelector('a.btn-login[onclick*="loginPopup"]');
       const openLayerBtn = Array.from(document.querySelectorAll('button.btn, a.btn')).find(el =>
         el.textContent.includes('로그인/회원가입')
@@ -725,18 +745,19 @@ async function processTask() {
 
       if (genieLoginBtn && genieLoginBtn.offsetParent !== null) {
         genieLoginBtn.click();
-        callPageFunction('loginPopup');
       } else if (openLayerBtn) {
         openLayerBtn.click();
         // 딜레이 0.3초 증가 (400 -> 700)
-        setTimeout(() => {
+        await taskDelay(700);
+        if (!await isTaskCurrent(data)) return;
+        {
           const gBtn = document.querySelector('a.btn-login[onclick*="loginPopup"]');
           if (gBtn) gBtn.click();
-          callPageFunction('loginPopup');
-        }, 700);
+          else callPageFunction('loginPopup');
+        }
       } else {
         const next = getNextStageUrl('ALBUM_LIKE', data);
-        window.location.href = "https://www.genie.co.kr/member/popLogin?page_rfr=" + encodeURIComponent(next.url);
+        navigateTask("https://www.genie.co.kr/member/popLogin?page_rfr=" + encodeURIComponent(next.url));
       }
       isStepRunning = false;
       return;
@@ -746,21 +767,23 @@ async function processTask() {
     if (step === 'ALBUM_LIKE') {
       if (albums && albumIndex < albums.length) {
         if (!currentUrl.includes('/detail/albumInfo') || !currentUrl.includes(albums[albumIndex])) {
-          window.location.href = getUrl('album', albums[albumIndex]);
+          navigateTask(getUrl('album', albums[albumIndex]));
           isStepRunning = false;
           return;
         }
-        performLikeWithCheck(async (ok, msg) => {
+        if (!await claimTaskAction('ALBUM_LIKE', data)) return;
+        await performLikeWithCheck(async (ok, msg) => {
+          if (!await isTaskCurrent(data)) return;
           await updateStepResult(currentAccount.id, 'album', ok ? 'o' : 'x');
           const nextIdx = albumIndex + 1;
           await saveLog(`💿 앨범(${albums[albumIndex]}) ${msg}`, ok ? 'SUCCESS' : 'ERROR');
           if (nextIdx < albums.length) {
             await chrome.storage.local.set({ albumIndex: nextIdx });
-            window.location.href = getUrl('album', albums[nextIdx]);
+            navigateTask(getUrl('album', albums[nextIdx]));
           } else {
             const next = getNextStageUrl('SONG_LIKE', data);
             await chrome.storage.local.set({ albumIndex: nextIdx, step: next.step });
-            window.location.href = next.url;
+            navigateTask(next.url);
           }
           isStepRunning = false;
         });
@@ -768,7 +791,7 @@ async function processTask() {
       } else {
         const next = getNextStageUrl('SONG_LIKE', data);
         await chrome.storage.local.set({ step: next.step });
-        window.location.href = next.url;
+        navigateTask(next.url);
         isStepRunning = false;
         return;
       }
@@ -779,15 +802,17 @@ async function processTask() {
       if (songs && songIndex < songs.length) {
         const currentSongSid = songs[songIndex];
         if (!currentUrl.includes('/detail/songInfo') || !currentUrl.includes(currentSongSid)) {
-          window.location.href = getUrl('song', currentSongSid);
+          navigateTask(getUrl('song', currentSongSid));
           isStepRunning = false;
           return;
         }
 
-        performLikeWithCheck(async (ok, msg) => {
+        if (!await claimTaskAction('SONG_LIKE', data)) return;
+        await performLikeWithCheck(async (ok, msg) => {
+          if (!await isTaskCurrent(data)) return;
           await updateStepResult(currentAccount.id, 'song', ok ? 'o' : 'x');
           await saveLog(`🎵 음원(${currentSongSid}) ${msg}`, ok ? 'SUCCESS' : 'ERROR');
-          await chrome.storage.local.set({ step: 'SONG_DOWNLOAD', waitRetry: 0 });
+          await chrome.storage.local.set({ step: 'SONG_DOWNLOAD', waitRetry: 0, downloadWaitStartedAt: Date.now() });
 
           const downBtn = document.querySelector(
             'a.btn-down, a[onclick*="fnBuySong"], a[onclick*="fnDownSong"], .song-main-infos a[title*="다운로드"]'
@@ -805,17 +830,19 @@ async function processTask() {
       } else {
         const next = getNextStageUrl('NEXT_ACCOUNT_LOGIN', data);
         await chrome.storage.local.set({ step: next.step });
-        window.location.href = next.url;
+        navigateTask(next.url);
         isStepRunning = false;
         return;
       }
     }
 
     if (['SONG_DOWNLOAD', 'PAY_POPUP_STEP1', 'WAIT_DOWNLOAD_STREAM'].includes(step)) {
+      if (window !== window.top) return;
       const retry = (data.waitRetry || 0) + 1;
       if (retry > 25) {
         await saveLog(`❌ 결제/다운로드 대기 시간 초과 -> 다음 계정 스킵`, 'ERROR');
-        chrome.runtime.sendMessage({ action: 'FORCE_ROLLOVER', reason: '결제/다운로드 타임아웃' });
+        chrome.runtime.sendMessage({ action: 'FORCE_ROLLOVER', reason: '결제/다운로드 타임아웃',
+          expected: { runId: data.runId, currentIndex: data.currentIndex || 0, songIndex: data.songIndex || 0 } });
       } else {
         await chrome.storage.local.set({ waitRetry: retry });
       }
@@ -831,7 +858,7 @@ async function processTask() {
         songIndex: 0,
         waitRetry: 0
       });
-      window.location.href = "https://www.genie.co.kr/member/popLogin?page_rfr=" + encodeURIComponent(firstStage.url);
+      navigateTask("https://www.genie.co.kr/member/popLogin?page_rfr=" + encodeURIComponent(firstStage.url));
       isStepRunning = false;
       return;
     }

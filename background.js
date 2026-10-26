@@ -25,6 +25,13 @@ async function appendLog(type, text) {
 
 // content.js와 메시지 통신
 chrome.runtime.onMessage.addListener((msg, sender, sendResponse) => {
+  if (msg.action === 'CLAIM_TASK_ACTION') {
+    claimTaskAction(msg.taskAction, msg.expected).then(
+      granted => sendResponse({ granted }),
+      () => sendResponse({ granted: false })
+    );
+    return true;
+  }
   if (msg.action === 'GET_SHEET_SEEDS') {
     getSheetSeeds().then(
       seeds => sendResponse({ ok: true, seeds }),
@@ -37,56 +44,44 @@ chrome.runtime.onMessage.addListener((msg, sender, sendResponse) => {
       chrome.storage.local.set({ mainTabId: sender.tab.id });
     }
   } else if (msg.action === 'FORCE_ROLLOVER') {
-    handleAccountRollover(msg.reason || '시간 초과/오류 스킵', true);
+    handleAccountRollover(msg.reason || '시간 초과/오류 스킵', true, msg.expected).catch(console.error);
   }
   sendResponse({ status: 'ok' });
   return true;
 });
 
-// 다운로드 스트림 시작 감지 -> 즉시 결제 팝업 닫고 다음 계정 전환
+// 다운로드 이벤트가 겹쳐도 한 곡의 결과와 계정 전환은 한 번만 처리합니다.
 chrome.downloads.onCreated.addListener(async (downloadItem) => {
-  const data = await chrome.storage.local.get(['isRunning', 'step', 'songs', 'songIndex', 'accounts', 'currentIndex', 'accountResults']);
-  if (!data.isRunning) return;
-
-  const isGenieDownload =
-    (downloadItem.url && downloadItem.url.includes('genie.co.kr')) ||
-    (downloadItem.referrer && downloadItem.referrer.includes('genie.co.kr')) ||
-    ['SONG_DOWNLOAD', 'PAY_POPUP_STEP1', 'WAIT_DOWNLOAD_STREAM'].includes(data.step);
-
-  if (isGenieDownload) {
-    const songs = data.songs || [];
-    const sIdx = data.songIndex || 0;
-    const nextSongIdx = sIdx + 1;
-    const currentAccount = data.accounts?.[data.currentIndex];
-
-    // 다운로드 성공('o') 기록
-    if (currentAccount) {
-      const results = data.accountResults || {};
-      if (!results[currentAccount.id]) results[currentAccount.id] = { album: '-', song: '-', down: '-' };
-      results[currentAccount.id].down = 'o';
-      await chrome.storage.local.set({ accountResults: results });
-    }
-
-    await appendLog('SUCCESS', `음원 다운로드 시작 감지 (${nextSongIdx}/${songs.length}) -> 팝업 닫기`);
-
-    // 등록된 곡이 여러 개일 경우 다음 곡으로, 모두 받았으면 다음 계정으로 롤오버
-    if (nextSongIdx < songs.length) {
-      await closePaymentPopups();
-      const nextSongUrl = `https://www.genie.co.kr/detail/songInfo?xgnm=${encodeURIComponent(songs[nextSongIdx])}`;
+  const data = await withStateLock(async () => {
+    const current = await chrome.storage.local.get(['isRunning', 'step', 'songs', 'songIndex', 'accounts', 'currentIndex', 'accountResults', 'runId']);
+    if (!current.isRunning || !downloadSteps.includes(current.step)) return null;
+    const songs = current.songs || [], index = current.songIndex || 0;
+    if (index >= songs.length) return null;
+    await chrome.storage.local.set({ step: 'DOWNLOAD_RECEIVED', waitRetry: 0 });
+    return current;
+  });
+  if (!data) return;
+  const nextSongIdx = (data.songIndex || 0) + 1;
+  const currentAccount = data.accounts?.[data.currentIndex];
+  if (currentAccount) {
+    const results = data.accountResults || {};
+    if (!results[currentAccount.id]) results[currentAccount.id] = { album: '-', song: '-', down: '-' };
+    results[currentAccount.id].down = 'o';
+    await chrome.storage.local.set({ accountResults: results });
+  }
+  await appendLog('SUCCESS', '음원 다운로드 시작 감지 (' + nextSongIdx + '/' + data.songs.length + ') → 팝업 닫기');
+  await closePaymentPopups();
+  const hasNext = nextSongIdx < data.songs.length;
+  await new Promise(resolve => setTimeout(resolve, hasNext ? 2000 : 4000));
+  if (hasNext) {
+    await withStateLock(async () => {
+      const current = await chrome.storage.local.get(['isRunning', 'runId', 'currentIndex', 'songIndex', 'step']);
+      if (!sameTask(current, data) || current.step !== 'DOWNLOAD_RECEIVED') return;
       await chrome.storage.local.set({ songIndex: nextSongIdx, step: 'SONG_LIKE', waitRetry: 0 });
-      
-      // 곡과 곡 사이 다운로드 안정화 대기 (2초)
-      await new Promise(resolve => setTimeout(resolve, 2000));
-      
-      await navigateMainTab(nextSongUrl);
-    } else {
-      await chrome.storage.local.set({ songIndex: nextSongIdx });
-      
-      // ⭐ 마지막 곡 다운로드 후 계정 로그아웃(전환) 전 파일 저장 대기시간 (4초 확보)
-      await new Promise(resolve => setTimeout(resolve, 4000)); 
-      
-      await handleAccountRollover('다운로드 완료', false);
-    }
+      await navigateMainTab('https://www.genie.co.kr/detail/songInfo?xgnm=' + encodeURIComponent(data.songs[nextSongIdx]));
+    });
+  } else {
+    await handleAccountRollover('다운로드 완료', false, data);
   }
 });
 
@@ -123,11 +118,15 @@ async function navigateMainTab(targetUrl) {
 }
 
 // 계정 전환 (로그아웃 ?page_rfr= 활용)
-async function handleAccountRollover(reason, isError) {
-  await closePaymentPopups();
+async function handleAccountRollover(reason, isError, expected) {
+  return withStateLock(() => performAccountRollover(reason, isError, expected));
+}
 
-  const data = await chrome.storage.local.get(['isRunning', 'accounts', 'currentIndex', 'accountResults']);
-  if (!data.isRunning) return;
+async function performAccountRollover(reason, isError, expected) {
+  const data = await chrome.storage.local.get(['isRunning', 'accounts', 'currentIndex', 'accountResults', 'runId', 'songIndex', 'step']);
+  if (!expected || !sameTask(data, expected) || data.step === 'ACCOUNT_ROLLOVER') return;
+  await chrome.storage.local.set({ step: 'ACCOUNT_ROLLOVER' });
+  await closePaymentPopups();
 
   const accounts = data.accounts || [];
   const currentAccount = accounts[data.currentIndex];
@@ -223,4 +222,46 @@ function parseSheetCsv(text) {
   if (quoted) throw new Error('시트 CSV 형식이 올바르지 않습니다.');
   row.push(value); rows.push(row);
   return rows;
+}
+
+
+const downloadSteps = ['SONG_DOWNLOAD', 'PAY_POPUP_STEP1', 'WAIT_DOWNLOAD_STREAM'];
+let stateQueue = Promise.resolve();
+function withStateLock(operation) {
+  const result = stateQueue.then(operation);
+  stateQueue = result.catch(() => {});
+  return result;
+}
+
+function sameTask(current, expected) {
+  return current.isRunning && current.runId === expected.runId &&
+    (current.currentIndex || 0) === (expected.currentIndex || 0) &&
+    (current.songIndex || 0) === (expected.songIndex || 0);
+}
+
+// 탭·프레임 사이에서 동일 작업을 한 번만 허용하고 새로고침 후에도 기록을 유지합니다.
+async function claimTaskAction(action, expected) {
+  const allowedSteps = {
+    ALBUM_LIKE: ['ALBUM_LIKE'], SONG_LIKE: ['SONG_LIKE'],
+    PAY_SONG: ['SONG_DOWNLOAD'], PAY_FINAL: downloadSteps,
+    OPEN_LOGIN: ['CHECK_OR_LOGIN'],
+    LOGIN: ['CHECK_OR_LOGIN', 'NEXT_ACCOUNT_LOGIN', 'ALBUM_LIKE', 'SONG_LIKE'],
+    LOGIN_FAILURE: ['CHECK_OR_LOGIN', 'NEXT_ACCOUNT_LOGIN', 'ALBUM_LIKE', 'SONG_LIKE']
+  };
+  if (!expected || !allowedSteps[action]) return false;
+  return withStateLock(async () => {
+    const current = await chrome.storage.local.get(['isRunning', 'runId', 'currentIndex', 'songIndex', 'albumIndex', 'step', 'actionClaims']);
+    if (!sameTask(current, expected) || (current.albumIndex || 0) !== (expected.albumIndex || 0) ||
+        !allowedSteps[action].includes(current.step)) return false;
+    const key = [current.runId || 'legacy', current.currentIndex || 0, current.albumIndex || 0, current.songIndex || 0, action].join(':');
+    const claims = current.actionClaims || {}, previous = claims[key];
+    const cooldown = action === 'LOGIN' ? 10000 : action === 'OPEN_LOGIN' ? 7000 : Infinity;
+    if (previous !== undefined && Date.now() - previous < cooldown) return false;
+    claims[key] = Date.now();
+    const updates = { actionClaims: claims };
+    if (action === 'PAY_SONG') Object.assign(updates, { step: 'PAY_POPUP_STEP1', waitRetry: 0 });
+    if (action === 'PAY_FINAL') Object.assign(updates, { step: 'WAIT_DOWNLOAD_STREAM', waitRetry: 0 });
+    await chrome.storage.local.set(updates);
+    return true;
+  });
 }
