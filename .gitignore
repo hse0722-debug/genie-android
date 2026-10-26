@@ -1,0 +1,12 @@
+# 개인 계정 및 실행 로그
+*.txt
+*.log
+.env
+.env.*
+node_modules/
+.DS_Store
+Thumbs.db
+
+# 확장 프로그램 서명 개인키
+*.pem
+*.key

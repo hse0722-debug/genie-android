@@ -1,0 +1,57 @@
+<!DOCTYPE html>
+<html lang="ko">
+<head>
+  <meta charset="utf-8">
+  <style>
+    body { width: 310px; font-family: 'Malgun Gothic', sans-serif; padding: 14px; margin: 0; background-color: #f9fafb; }
+    h3 { margin: 0 0 10px 0; font-size: 15px; color: #111827; border-bottom: 2px solid #0095ff; padding-bottom: 6px; }
+    label { font-size: 12px; font-weight: bold; color: #374151; display: block; margin-top: 10px; }
+    input[type="text"], input[type="file"], select {
+      width: 100%; box-sizing: border-box; margin-top: 4px; padding: 7px;
+      font-size: 12px; border: 1px solid #d1d5db; border-radius: 4px; background: #fff;
+    }
+    .drop-zone {
+      margin-top: 5px; padding: 8px; border: 2px dashed #93c5fd; border-radius: 5px;
+      background: #eff6ff; text-align: center; font-size: 11px; color: #1d4ed8; cursor: pointer;
+    }
+    .drop-zone.dragover { background: #dbeafe; border-color: #2563eb; }
+    .status-box {
+      margin-top: 6px; padding: 6px 8px; background: #dcfce7; border-radius: 4px;
+      font-size: 11px; color: #166534; font-weight: bold; line-height: 1.4;
+    }
+    button {
+      width: 100%; margin-top: 10px; padding: 9px; font-size: 12px; font-weight: bold;
+      cursor: pointer; background: #0095ff; color: white; border: none; border-radius: 5px;
+    }
+    button:hover { background: #0077cc; }
+    button#stopBtn { background: #f59e0b; margin-top: 6px; }
+    button#stopBtn:hover { background: #d97706; }
+    button#resetBtn { background: #e5e7eb; color: #374151; font-weight: normal; padding: 6px; font-size: 11px; margin-top: 6px; }
+  </style>
+</head>
+<body>
+  <h3>지니 자동화 (앨범 ➔ 곡 ➔ 다운)</h3>
+  
+  <label>1. 계정 목록 파일 등록 (.txt)</label>
+  <input type="file" id="accountFile" accept=".txt">
+  <div id="dropZone" class="drop-zone">또는 여기에 .txt 파일을 끌어다 놓으세요</div>
+  <div id="statusMsg" class="status-box">등록된 계정 없음</div>
+
+  <label>2. 시작할 계정 순서 선택</label>
+  <select id="accountSelect">
+    <option value="0">계정 파일을 먼저 등록해주세요</option>
+  </select>
+
+  <label>3. [먼저 실행] 앨범 번호 (axnm 숫자)</label>
+  <input type="text" id="albumId" placeholder="예: 88007852">
+
+  <label>4. [다음 실행] 곡 번호 (xgnm 숫자)</label>
+  <input type="text" id="songId" placeholder="예: 114676440">
+
+  <button id="startBtn">선택한 순번부터 자동 작업 시작</button>
+  <button id="stopBtn">진행 중인 자동 작업 일시정지</button>
+  <button id="resetBtn">저장된 모든 데이터 초기화</button>
+
+  <script src="popup.js"></script>
+</body>
+</html>
