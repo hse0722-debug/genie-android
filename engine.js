@@ -138,6 +138,7 @@ async function handleAccountRollover(reason, isError, expected) {
 async function performAccountRollover(reason, isError, expected) {
   const data = await chrome.storage.local.get(['isRunning', 'accounts', 'currentIndex', 'accountResults', 'runId', 'songIndex', 'step', 'verifiedSession', 'albums', 'songs', 'mvs', 'artists']);
   if (!expected || !sameTask(data, expected) || data.step === 'ACCOUNT_ROLLOVER') return;
+  await chrome.storage.local.set({step:'ACCOUNT_ROLLOVER'});
   await closePaymentPopups();
   const latest=await chrome.storage.local.get(['isRunning','runId','currentIndex','songIndex']);if(!sameTask(latest,data))return;
 
@@ -319,7 +320,7 @@ async function accountAuthRequest(msg,sender) {
       }
       const seq=data.authSequence;
       if(!seq || seq.runId!==data.runId || seq.index!==(data.currentIndex||0) || seq.account!==account.id)return stopAccountAuth('로그인 순서 정보가 일치하지 않습니다',data);
-      if(msg.action==='AUTH_FAIL')return stopAccountAuth('지니 로그인 화면에서 오류가 확인되었습니다',data);
+      if(msg.action==='AUTH_FAIL')return failAccountAndAdvance('로그인 화면 오류 또는 아이디·비밀번호 확인 실패',data);
       if(msg.action==='AUTH_LOGOUT_CHECK' && data.step==='AUTH_LOGOUT' && seq.phase==='LOGOUT') {
         const session=await probe();
         if(session.loggedIn) {
@@ -334,7 +335,7 @@ async function accountAuthRequest(msg,sender) {
         return {ok:true,url:authLoginUrl};
       }
       if(msg.action==='AUTH_SUBMIT' && data.step==='AUTH_FORM' && seq.phase==='FORM') {
-        if(Date.now()-seq.logoutConfirmedAt>60000)return stopAccountAuth('로그인 준비 시간이 초과되었습니다',data);
+        if(Date.now()-seq.logoutConfirmedAt>60000)return failAccountAndAdvance('로그인 준비 시간 초과',data);
         if((await probe()).loggedIn)return stopAccountAuth('대상 계정 로그인 전에 다른 로그인 세션이 나타났습니다',data);
         await chrome.storage.local.set({step:'AUTH_WAIT',authSequence:{...seq,phase:'WAIT',submittedAt:Date.now()}});
         await appendLog('INFO','로그아웃 확인 후 대상 계정 로그인 1회 제출');
@@ -342,7 +343,7 @@ async function accountAuthRequest(msg,sender) {
       }
       if(msg.action==='AUTH_LOGIN_CHECK' && data.step==='AUTH_WAIT' && seq.phase==='WAIT') {
         const session=await probe();
-        if(!session.loggedIn){if(Date.now()-seq.submittedAt>30000)return stopAccountAuth('대상 계정 로그인 성공이 확인되지 않았습니다',data);return {ok:true,waiting:true};}
+        if(!session.loggedIn){if(Date.now()-seq.submittedAt>30000)return failAccountAndAdvance('대상 계정 로그인 시간 초과',data);return {ok:true,waiting:true};}
         if(seq.previousAccount && seq.previousAccount!==account.id && seq.previousMember===session.memberNo)return stopAccountAuth('이전 계정과 동일한 회원 세션이 다시 확인되었습니다',data);
         const bindings=data.accountMemberBindings||{};
         if(bindings[account.id] && bindings[account.id]!==session.memberNo)return stopAccountAuth('대상 계정에 이전에 확인된 회원번호와 다릅니다',data);
@@ -451,12 +452,20 @@ let leaseCheckpoint=null,sessionCheckpoint=null;
 async function assertAccountLease(data,forceFresh=false){const context=(await chrome.storage.local.get(['sheetContext'])).sheetContext;if(!context)return true;const key=context.jobId+':'+(data.currentIndex||0);if(!forceFresh&&leaseCheckpoint?.key===key&&Date.now()-leaseCheckpoint.at<5000)return true;try{await sheetApi('heartbeat',{...context,accounts:[data.accounts?.[data.currentIndex||0]?.id]});leaseCheckpoint={key,at:Date.now()};return true;}catch(error){await stopAccountAuth('계정 시트 확인 실패: '+error.message,data);return false;}}
 async function nextSheetAccounts(data,state){
  const d=await chrome.storage.local.get(null),context=d.sheetContext;if(!context)return data.accounts;
- const id=data.accounts?.[data.currentIndex||0]?.id;const sync=await sheetTick(true);if(!sync.ok)throw Error(sync.error);
- await sheetApi('status',{...context,accounts:[id],state});
+ const id=data.accounts?.[data.currentIndex||0]?.id;
  const checkpoint=await chrome.storage.local.get(null);if(!sameTask(checkpoint,data))throw Error('작업이 중단되거나 변경되었습니다.');
- const completed=[...new Set([...progressIds(checkpoint,d.sheetSelection),id])];await saveProgress(checkpoint,d.sheetSelection,completed);const fresh=await sheetApi('accounts',d.sheetSelection);const done=new Set(completed),prefix=data.accounts.slice(0,(data.currentIndex||0)+1),remaining=accountValues(fresh.accounts.filter(r=>!done.has(r.id))),accounts=[...prefix,...remaining];
+ const completed=[...new Set([...progressIds(checkpoint,d.sheetSelection),id])];await saveProgress(checkpoint,d.sheetSelection,completed);
+ const sync=await sheetTick(true);if(!sync.ok)throw Error(sync.error);
+ await sheetApi('status',{...context,accounts:[id],state});
+ const fresh=await sheetApi('accounts',d.sheetSelection);const done=new Set(completed),prefix=data.accounts.slice(0,(data.currentIndex||0)+1),remaining=accountValues(fresh.accounts.filter(r=>!done.has(r.id))),accounts=[...prefix,...remaining];
  const latest=await chrome.storage.local.get(null);if(!sameTask(latest,data))throw Error('작업이 중단되거나 변경되었습니다.');
  await chrome.storage.local.set({sheetCompletedIds:completed,accounts,sheetContext:{...context,accounts:accounts.map(a=>a.id)},sheetLiveAt:Date.now()});return accounts;
 }
 
 async function getSheetSeeds(){const result=await sheetApi('seeds');const s=result.seeds;return {albumName:s.album.name,albumSid:s.album.sid,songName:s.song.name,songSid:s.song.sid,mvName:s.mv.name,mvSid:s.mv.sid,artistName:s.artist.name,artistSid:s.artist.sid};}
+
+async function failAccountAndAdvance(message,data){
+ const now=await chrome.storage.local.get(['isRunning','runId','currentIndex','songIndex','step']);if(!sameTask(now,data)||now.step==='ACCOUNT_ROLLOVER')return {ok:false};
+ await appendLog('ERROR',message+' → 다음 계정으로 넘김');
+ await performAccountRollover(message,true,data);return {ok:false,advanced:true};
+}
