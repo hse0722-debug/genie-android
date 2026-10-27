@@ -59,6 +59,7 @@ chrome.runtime.onMessage.addListener((msg, sender, sendResponse) => {
 
 // 다운로드 이벤트가 겹쳐도 한 곡의 결과와 계정 전환은 한 번만 처리합니다.
 chrome.downloads.onCreated.addListener(async (downloadItem) => {
+  if(isNonAudioExport(downloadItem))return;
   engineActive=true;await chrome.storage.local.set({sheetEngineOwner:engineToken});
   const data = await withStateLock(async () => {
     const current = await chrome.storage.local.get(['isRunning', 'step', 'songs', 'songIndex', 'accounts', 'currentIndex', 'accountResults', 'runId', 'verifiedSession', 'skipRequested', 'downloadEventId', 'downloadReceivedAt', 'logs']);
@@ -486,3 +487,9 @@ function verifiedStageUrl(data){
  const route=routes[data.step];if(!route||!/^\d+$/.test(String(route[2]||'')))return null;
  return 'https://www.genie.co.kr/detail/'+route[0]+'?'+route[1]+'='+encodeURIComponent(route[2]);
 }
+
+function isNonAudioExport(item){
+ const url=String(item?.url||'');const name=String(item?.filename||'').split(/[\\/]/).pop();
+ return /^data:(text\/plain|application\/json)[;,]/i.test(url)||/^genie_(download_log_|unsynced_results)/i.test(name||'');
+}
+
