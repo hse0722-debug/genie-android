@@ -393,7 +393,7 @@ async function ensureClientId(){const d=await chrome.storage.local.get(['sheetCl
 async function sheetApi(action,extra={}){
  const d=await chrome.storage.local.get(['sheetConfig','sheetSelection','accounts','currentIndex','isRunning','step']);const c=d.sheetConfig;
  if(!c?.endpoint)throw Error('웹 앱 주소를 저장하세요.');if(!/^https:\/\/script\.google\.com\/macros\/s\/[\w-]+\/exec$/.test(c.endpoint))throw Error('Apps Script /exec 주소를 입력하세요.');
- const start=Date.now(),payload=JSON.stringify({action,helper:d.sheetSelection?.helper||'',accountId:d.accounts?.[d.currentIndex||0]?.id||'',isRunning:!!d.isRunning,step:d.step,...extra});
+ const start=Date.now(),payload=JSON.stringify({action,columnLayout:'password-e-v1',helper:d.sheetSelection?.helper||'',accountId:d.accounts?.[d.currentIndex||0]?.id||'',isRunning:!!d.isRunning,step:d.step,...extra});
  const retryable=['catalog','accounts','seeds','heartbeat'].includes(action),attempts=retryable?3:1;
  for(let attempt=0;attempt<attempts;attempt++){
   let response;
@@ -457,7 +457,7 @@ async function sheetTick(force=false){
 }
 async function prepareAccount(data){
  const d=await chrome.storage.local.get(['sheetContext','accountPrepared']);if(!d.sheetContext)return;if(d.accountPrepared?.runId===data.runId&&d.accountPrepared.index===(data.currentIndex||0))return;
- const id=data.accounts?.[data.currentIndex||0]?.id,result=await sheetApi('prepare',{...d.sheetContext,accounts:[id]}),fresh=result.accounts?.find(a=>a.id===id);if(!fresh?.password)throw Error('현재 계정과 J열 비밀번호를 확인하세요.');
+ const id=data.accounts?.[data.currentIndex||0]?.id,result=await sheetApi('prepare',{...d.sheetContext,accounts:[id]}),fresh=result.accounts?.find(a=>a.id===id);if(!fresh?.password)throw Error('현재 계정과 E열 비밀번호를 확인하세요.');
  const current=await chrome.storage.local.get(null);if(!sameTask(current,data)||skipMatchesAccount(current)||current.step!==data.step)throw Error('로그인 순서가 변경되었습니다.');const accounts=current.accounts;accounts[data.currentIndex||0]={id:fresh.id,pw:fresh.password,row:fresh.row,number:fresh.number};await chrome.storage.local.set({accounts,accountPrepared:{runId:data.runId,index:data.currentIndex||0,at:Date.now()}});
 }
 let leaseCheckpoint=null,sessionCheckpoint=null;
