@@ -1,4 +1,4 @@
-/** 지니 시트 연결 서버 10.0.5 — 이 파일은 Apps Script에만 설치합니다. */
+/** 지니 시트 연결 서버 10.0.9 — 이 파일은 Apps Script에만 설치합니다. */
 const GENIE_SEED_ID='1KS0avSMsGkba5zeDb2IZ_v2p1bJGW7uXm5hcDV_2q24';
 const GENIE_ACCOUNT_ID='14SWMDCFfxYGFAuoTMxahDKTcranKXmyfVDu31SH7OEw';
 function onOpen(){SpreadsheetApp.getUi().createMenu('지니 연동').addItem('1. 초기 설정','setupGenie').addItem('계정 파일 추가 허용','allowAccountFile').addToUi();}
@@ -6,27 +6,33 @@ function setupGenie(){const p=PropertiesService.getScriptProperties();if(!p.getP
 function allowAccountFile(){const ui=SpreadsheetApp.getUi(),r=ui.prompt('계정 파일 추가','허용할 Google 시트 주소 또는 파일 ID',ui.ButtonSet.OK_CANCEL);if(r.getSelectedButton()!==ui.Button.OK)return;const value=r.getResponseText().trim(),id=(value.match(/\/d\/([\w-]+)/)||[])[1]||value;if(!/^[\w-]{20,}$/.test(id))throw Error('주소를 확인하세요.');SpreadsheetApp.openById(id);const p=PropertiesService.getScriptProperties(),ids=JSON.parse(p.getProperty('ACCOUNT_IDS')||'[]');p.setProperty('ACCOUNT_IDS',JSON.stringify([...new Set([...ids,id])]));ui.alert('허용했습니다. 같은 파일의 새 탭은 추가 설정 없이 사용할 수 있습니다.');}
 function hashKey_(value){return Utilities.computeDigest(Utilities.DigestAlgorithm.SHA_256,String(value)).map(n=>('0'+((n+256)%256).toString(16)).slice(-2)).join('');}
 function json_(value){return ContentService.createTextOutput(JSON.stringify(value)).setMimeType(ContentService.MimeType.JSON);}
-function doGet(){return json_({ok:true,service:'genie-sheet',version:'10.0.5',message:'시트 연결용 POST 요청을 받습니다.'});}
+function doGet(){return json_({ok:true,service:'genie-sheet',version:'10.0.9',message:'시트 연결용 POST 요청을 받습니다.'});}
 function seeds_(p){const book=SpreadsheetApp.openById(p.getProperty('SEED_ID')||GENIE_SEED_ID),sheet=book.getSheets().find(s=>s.getSheetId()===Number(p.getProperty('SEED_GID')||0));if(!sheet)throw Error('시드 탭이 없습니다.');const cells=sheet.getRange('C3:D7').getDisplayValues(),out={};for(const [key,r,c] of [['album',0,0],['song',0,1],['mv',3,0],['artist',3,1]]){const name=String(cells[r][c]).trim(),sid=String(cells[r+1][c]).trim();if(!name&&!sid){out[key]={name:'',sid:''};continue;}if(!name||!/^\d+$/.test(sid))throw Error(key+' 이름·숫자 시드를 함께 입력하세요.');out[key]={name,sid};}return out;}
 function leaseKey_(req,id){return 'LEASE_'+hashKey_('account:'+id);}
 
 function safeCell_(value){const text=String(value??'').slice(0,500);return /^[=+@-]/.test(text)?"'"+text:text;}
 function statusColumns_(sheet){
- const expected=['지니 작업 상태','지니 작업 기기','지니 마지막 확인'];
- if(sheet.getMaxColumns()<13)sheet.insertColumnsAfter(sheet.getMaxColumns(),13-sheet.getMaxColumns());
- const current=sheet.getRange(2,11,1,3).getDisplayValues()[0];
+ const expected=['작업상태','작업시간'];
+ if(sheet.getMaxColumns()<12)sheet.insertColumnsAfter(sheet.getMaxColumns(),12-sheet.getMaxColumns());
+ const current=sheet.getRange(2,11,1,2).getDisplayValues()[0];
  if(current.every((v,i)=>v===expected[i]))return;
- const cells=sheet.getRange(1,11,Math.max(2,sheet.getLastRow()),3);
- if(cells.getDisplayValues().some(r=>r.some(v=>v!==''))||cells.getFormulas().some(r=>r.some(Boolean)))throw Error('K~M열에 기존 데이터가 있습니다. K~M열을 비운 뒤 다시 시작하세요.');
- sheet.getRange(2,11,1,3).setValues([expected]);
+ if(current[0]==='지니 작업 상태'&&current[1]==='지니 작업 기기'&&sheet.getMaxColumns()>=13&&sheet.getRange(2,13).getDisplayValue()==='지니 마지막 확인'){
+  const count=Math.max(0,sheet.getLastRow()-2);
+  if(count){const times=sheet.getRange(3,13,count,1).getValues(),formulas=sheet.getRange(3,11,count,1).getFormulas();sheet.getRange(3,12,count,1).setValues(times).setNumberFormat('yyyy-MM-dd HH:mm:ss');for(let i=0;i<count;i++)if(formulas[i][0])sheet.getRange(i+3,11).setFormula(formulas[i][0].replace(/\bM(\d+)\b/g,'L$1'));}
+  sheet.getRange(2,13,Math.max(1,sheet.getLastRow()-1),1).clearContent();
+ }else{
+  const cells=sheet.getRange(1,11,Math.max(2,sheet.getLastRow()),2);
+  if(cells.getDisplayValues().some(r=>r.some(v=>v!==''))||cells.getFormulas().some(r=>r.some(Boolean)))throw Error('K~L열에 기존 데이터가 있습니다. 작업 표시용 K~L열을 비운 뒤 연결하세요.');
+ }
+ sheet.getRange(2,11,1,2).setValues([expected]);
 }
 function accountStatus_(req,sheet,rows,state){
  statusColumns_(sheet);const phase={AUTH_LOGOUT:'로그아웃',AUTH_FORM:'로그인',AUTH_WAIT:'로그인 확인',ALBUM_LIKE:'앨범',SONG_LIKE:'곡',SONG_DOWNLOAD:'다운로드',PAY_POPUP_STEP1:'다운로드 준비',WAIT_DOWNLOAD_STREAM:'다운로드 대기',MV_LIKE:'뮤비',ARTIST_LIKE:'가수'}[req.step]||'진행';
  for(const row of rows){
-  const range=sheet.getRange(row.row,11,1,3);
-  range.setValues([[state,safeCell_((req.helper||'')+' · '+(req.clientId||'').slice(0,8)),new Date()]]);
-  sheet.getRange(row.row,13).setNumberFormat('yyyy-MM-dd HH:mm:ss');
-  if(state==='작업 중')sheet.getRange(row.row,11).setFormula('=IF(NOW()-M'+row.row+'>TIME(0,2,0),"연결 확인 필요","작업 중 · '+phase+'")');
+  const range=sheet.getRange(row.row,11,1,2);
+  range.setValues([[state,new Date()]]);
+  sheet.getRange(row.row,12).setNumberFormat('yyyy-MM-dd HH:mm:ss');
+  if(state==='작업 중')sheet.getRange(row.row,11).setFormula('=IF(NOW()-L'+row.row+'>TIME(0,2,0),"연결 확인 필요","작업 중 · '+phase+'")');
  }
 }
 function releaseAccounts_(req,p,sheet){
@@ -38,10 +44,12 @@ function releaseAccounts_(req,p,sheet){
 function rows_(sheet,withPasswords=true){const count=sheet.getLastRow()-2;if(count<1)return [];const rows=sheet.getRange(3,1,count,4).getDisplayValues(),passwords=withPasswords?sheet.getRange(3,10,count,1).getValues():[];let time='';return rows.map((r,i)=>{if(String(r[1]).trim())time=String(r[1]).trim();return {row:i+3,number:String(r[0]).trim(),time,helper:String(r[2]).trim(),id:String(r[3]).trim(),password:withPasswords?String(passwords[i][0]??''):''};}).filter(r=>/^\d+$/.test(r.number)&&r.id&&r.helper);}
 function pickRows_(req,client,sheet,prepared){const all=prepared||rows_(sheet);if(!all.some(r=>r.helper===String(req.helper)))throw Error('선택한 헬퍼가 C열에 없습니다.');const rows=all.filter(r=>r.helper===req.helper&&r.time===req.time);const seen=new Set();for(const row of rows){if(seen.has(row.id))throw Error('선택 범위에 중복 아이디가 있습니다.');seen.add(row.id);}return rows;}
 function handle_(req,client,sheet,p){
+ statusColumns_(sheet);
  const rows=rows_(sheet,['accounts','start','prepare'].includes(req.action));
  if(req.action==='catalog')return {ok:true,title:sheet.getName(),helpers:[...new Set(rows.map(r=>r.helper))],times:[...new Set(rows.map(r=>r.time).filter(Boolean))],pairs:[...new Map(rows.map(r=>[r.helper+'\u0000'+r.time,{helper:r.helper,time:r.time}])).values()]};
  const selected=pickRows_(req,client,sheet,rows);
  if(req.action==='accounts'){const valid=selected.filter(r=>r.password.length>0);return {ok:true,title:sheet.getName(),accounts:valid,excluded:selected.length-valid.length};}
+ if(req.action==='resetStatus'){const now=Date.now();for(const row of selected){const lease=JSON.parse(p.getProperty(leaseKey_(req,row.id))||'null');if(lease&&lease.until>now)throw Error('선택 범위에 작업 중인 계정이 있습니다. 모든 기기에서 중단 후 다시 초기화하세요.');}for(const row of selected)sheet.getRange(row.row,11,1,2).clearContent();return {ok:true,cleared:selected.length};}
  if(!/^[\w-]{10,100}$/.test(req.jobId||''))throw Error('작업 ID 오류');
  const now=Date.now(),requested=req.accounts||[];if(!Array.isArray(requested)||requested.length>2000)throw Error('계정 수 오류');
  const targets=requested.map(id=>{const row=selected.find(r=>r.id===id);if(!row)throw Error('계정 배정·시간이 변경되었습니다. 다시 불러오세요.');return row;});
@@ -61,7 +69,7 @@ function handle_(req,client,sheet,p){
 function doPost(e){try{
  const raw=e?.postData?.contents;if(!raw||raw.length>150000)throw Error('요청 크기 오류');const req=JSON.parse(raw),p=PropertiesService.getScriptProperties();
  if(req.action==='seeds')return json_({ok:true,seeds:seeds_(p)});
- if(!['catalog','accounts','claim','heartbeat','write','release','start','prepare','status'].includes(req.action))throw Error('Apps Script 새 버전 배포를 확인하세요.');
+ if(!['catalog','accounts','claim','heartbeat','write','release','start','prepare','status','resetStatus'].includes(req.action))throw Error('Apps Script 새 버전 배포를 확인하세요.');
  const ids=JSON.parse(p.getProperty('ACCOUNT_IDS')||'[]');if(!ids.includes(req.spreadsheetId))throw Error('관리자가 허용하지 않은 계정 파일입니다.');
  const book=SpreadsheetApp.openById(req.spreadsheetId),sheet=book.getSheets().find(s=>s.getSheetId()===Number(req.gid));if(!sheet)throw Error('탭(gid)을 찾을 수 없습니다.');
  const lock=LockService.getScriptLock();if(!lock.tryLock(15000))throw Error('다른 요청을 처리 중입니다. 다시 시도하세요.');try{if(req.action==='release'){if(!/^[\w-]{10,100}$/.test(req.jobId||'')||!Array.isArray(req.accounts)||req.accounts.length>2000)throw Error('잠금 해제 요청 오류');releaseAccounts_(req,p,sheet);return json_({ok:true});}return json_(handle_(req,null,sheet,p));}finally{lock.releaseLock();}

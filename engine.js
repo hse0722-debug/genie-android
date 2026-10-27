@@ -382,7 +382,7 @@ async function ensureClientId(){const d=await chrome.storage.local.get(['sheetCl
 async function sheetApi(action,extra={}){
  const d=await chrome.storage.local.get(['sheetConfig','sheetSelection','accounts','currentIndex','isRunning','step']);const c=d.sheetConfig;
  if(!c?.endpoint)throw Error('웹 앱 주소를 저장하세요.');if(!/^https:\/\/script\.google\.com\/macros\/s\/[\w-]+\/exec$/.test(c.endpoint))throw Error('Apps Script /exec 주소를 입력하세요.');
- const start=Date.now(),payload=JSON.stringify({action,clientId:await ensureClientId(),helper:d.sheetSelection?.helper||'',accountId:d.accounts?.[d.currentIndex||0]?.id||'',isRunning:!!d.isRunning,step:d.step,...extra});
+ const start=Date.now(),payload=JSON.stringify({action,helper:d.sheetSelection?.helper||'',accountId:d.accounts?.[d.currentIndex||0]?.id||'',isRunning:!!d.isRunning,step:d.step,...extra});
  const retryable=['catalog','accounts','seeds','heartbeat'].includes(action),attempts=retryable?3:1;
  for(let attempt=0;attempt<attempts;attempt++){
   let response;
@@ -399,7 +399,7 @@ function progressIds(d,selection){
 }
 async function saveProgress(d,selection,ids){const progress={...(d.sheetProgress||{}),[selectionKey(selection)]:[...new Set(ids)]};await chrome.storage.local.set({sheetProgress:progress,sheetCompletedIds:progress[selectionKey(selection)]});}
 function seedValues(s){return {albums:s.album.sid?[s.album.sid]:[],songs:s.song.sid?[s.song.sid]:[],mvs:s.mv.sid?[s.mv.sid]:[],artists:s.artist.sid?[s.artist.sid]:[],sheetAlbumName:s.album.name,sheetSongName:s.song.name,sheetMvName:s.mv.name,sheetArtistName:s.artist.name,sheetSeedsFetchedAt:Date.now()};}
-function accountValues(rows){return rows.map(r=>({id:r.id,pw:r.password,row:r.row}));}
+function accountValues(rows){return rows.map(r=>({id:r.id,pw:r.password,row:r.row,number:r.number}));}
 async function sheetCommand(msg){
  if(msg.action==='SHEET_SYNC')return sheetTick(msg.force!==false);
  const d=await chrome.storage.local.get(null);if(d.isRunning)throw Error('먼저 작업을 중단하세요.');
@@ -416,6 +416,7 @@ async function sheetCommand(msg){
  await saveProgress(snapshot,selection,ids);
  await chrome.storage.local.set({sheetSelection:selection,accounts,currentIndex:0,sheetExcluded:fresh.excluded,sheetLiveAt:Date.now(),...(changed?{sheetContext:null,accountResults:{},sheetSynced:{}}:{})});return {ok:true,count:accounts.length};
  }
+ if(msg.action==='SHEET_RESET_STATUS'){if(!d.sheetSelection)throw Error('시간과 헬퍼를 선택하세요.');const sync=await sheetTick(true);if(!sync.ok)throw Error(sync.error);return sheetApi('resetStatus',d.sheetSelection);}
  if(msg.action==='SHEET_NEW_RUN'){
  const sync=await sheetTick(true);if(!sync.ok)throw Error(sync.error);const now=await chrome.storage.local.get(null);if(!now.sheetSelection)throw Error('시간과 헬퍼를 먼저 선택하세요.');
  await saveProgress(now,now.sheetSelection,[]);await chrome.storage.local.set({accounts:[],currentIndex:0,accountResults:{},sheetSynced:{},sheetContext:null});return {ok:true};
@@ -446,7 +447,7 @@ async function sheetTick(force=false){
 async function prepareAccount(data){
  const d=await chrome.storage.local.get(['sheetContext','accountPrepared']);if(!d.sheetContext)return;if(d.accountPrepared?.runId===data.runId&&d.accountPrepared.index===(data.currentIndex||0))return;
  const id=data.accounts?.[data.currentIndex||0]?.id,result=await sheetApi('prepare',{...d.sheetContext,accounts:[id]}),fresh=result.accounts?.find(a=>a.id===id);if(!fresh?.password)throw Error('현재 계정과 J열 비밀번호를 확인하세요.');
- const current=await chrome.storage.local.get(null);if(!sameTask(current,data)||skipMatchesAccount(current)||current.step!==data.step)throw Error('로그인 순서가 변경되었습니다.');const accounts=current.accounts;accounts[data.currentIndex||0]={id:fresh.id,pw:fresh.password,row:fresh.row};await chrome.storage.local.set({accounts,accountPrepared:{runId:data.runId,index:data.currentIndex||0,at:Date.now()}});
+ const current=await chrome.storage.local.get(null);if(!sameTask(current,data)||skipMatchesAccount(current)||current.step!==data.step)throw Error('로그인 순서가 변경되었습니다.');const accounts=current.accounts;accounts[data.currentIndex||0]={id:fresh.id,pw:fresh.password,row:fresh.row,number:fresh.number};await chrome.storage.local.set({accounts,accountPrepared:{runId:data.runId,index:data.currentIndex||0,at:Date.now()}});
 }
 let leaseCheckpoint=null,sessionCheckpoint=null;
 async function assertAccountLease(data,forceFresh=false){const context=(await chrome.storage.local.get(['sheetContext'])).sheetContext;if(!context)return true;const key=context.jobId+':'+(data.currentIndex||0);if(!forceFresh&&leaseCheckpoint?.key===key&&Date.now()-leaseCheckpoint.at<5000)return true;try{await sheetApi('heartbeat',{...context,accounts:[data.accounts?.[data.currentIndex||0]?.id]});leaseCheckpoint={key,at:Date.now()};return true;}catch(error){await stopAccountAuth('계정 시트 확인 실패: '+error.message,data);return false;}}
