@@ -143,7 +143,7 @@ async function createFloatingPanel(){
  #genie-helper-dashboard details[open]>summary{margin-bottom:8px}
  #genie-helper-dashboard .gs-details-table{max-height:160px;overflow:auto}
  </style>
- <header id="dash-header" style="padding:12px 14px;background:#0b3768;color:white;display:flex;align-items:center;justify-content:space-between;touch-action:none"><strong>지니 다운 도우미 <small style="display:inline;color:#c6e5ff">${globalThis.__genieRuntimeVersion||'10.0.12'}</small></strong><button id="gs-hide" style="background:transparent">숨기기</button></header>
+ <header id="dash-header" style="padding:12px 14px;background:#0b3768;color:white;display:flex;align-items:center;justify-content:space-between;touch-action:none"><strong>지니 다운 도우미 <small style="display:inline;color:#c6e5ff">${globalThis.__genieRuntimeVersion||'10.0.13'}</small></strong><button id="gs-hide" style="background:transparent">숨기기</button></header>
  <div class="gs-card"><h3>구글 시트 연결</h3><details id="gs-address-settings" ${d.sheetConfig?.endpoint?'':'open'}><summary>연결 주소 설정</summary><div id="gs-settings"><label>Apps Script 웹 앱 주소</label><input id="gs-endpoint" placeholder="https://script.google.com/macros/s/…/exec"></div><label style="margin-top:7px">계정 시트 주소</label><input id="gs-url" placeholder="gid가 포함된 시트 탭 주소"><button id="gs-save" style="margin:7px 0">연결 설정 저장</button></details><div class="gs-row" style="margin-top:7px"><div><label>작업 시간</label><select id="gs-time"></select></div><div><label>담당 헬퍼</label><select id="gs-helper"></select></div></div><small id="gs-connection">시트 자동 연결</small></div>
  <div class="gs-card gs-current"><div class="gs-row" style="justify-content:space-between"><span style="font-size:12px">현재 작업 중인 아이디</span><b id="gs-current-state" style="font-size:12px;color:#07519c">대기</b></div><div id="gs-current-account">작업 대기</div><small id="gs-current-location">시트 연결 후 시작하세요.</small><div id="dash-summary" class="gs-status" style="margin-top:5px"></div></div>
  <div class="gs-card"><h3>시트 계정 현황</h3><table><thead><tr><th style="width:36px">행</th><th style="width:40px">번호</th><th>아이디</th><th style="width:78px">상태</th></tr></thead><tbody id="gs-account-list"></tbody></table><small>대기 계정 수정 → 다음 계정 시작 전 반영<br>현재 작업 계정 수정 → 중단 후 반영</small></div>
@@ -161,7 +161,7 @@ async function createFloatingPanel(){
  const connectSheet=async()=>{if(connecting||!endpointSaved||(await chrome.storage.local.get(['isRunning'])).isRunning)return;connecting=true;try{const previous={time:el('gs-time').value,helper:el('gs-helper').value};gsCatalog=await message({action:'SHEET_CATALOG',url:el('gs-url').value.trim()});fill(previous);await selectSheet();}finally{connecting=false;}};
  el('gs-save').onclick=guarded(async()=>{await idle();await message({action:'SHEET_PREPARE_CHANGE'});await chrome.storage.local.set({sheetConfig:{endpoint:el('gs-endpoint').value.trim()}});endpointSaved=true;await connectSheet();await loadSheetSeeds();el('gs-address-settings').open=false;});
  el('gs-time').onchange=guarded(async()=>{helpersForTime();await selectSheet();});el('gs-helper').onchange=guarded(selectSheet);el('gs-url').onchange=guarded(connectSheet);
- el('btn-resume').onclick=guarded(async()=>{setLogExportRunning(true);await idle();await selectSheet();const r=await message({action:'SHEET_START'});await saveLog('▶ 시트 계정 자동화 시작 · 작업 코드 '+(globalThis.__genieRuntimeVersion||'10.0.12'),'INFO');navigateTask(r.url||'https://www.genie.co.kr/',true);});
+ el('btn-resume').onclick=guarded(async()=>{setLogExportRunning(true);await idle();await selectSheet();const r=await message({action:'SHEET_START'});await saveLog('▶ 시트 계정 자동화 시작 · 작업 코드 '+(globalThis.__genieRuntimeVersion||'10.0.13'),'INFO');navigateTask(r.url||'https://www.genie.co.kr/',true);});
  setTimeout(()=>connectSheet().catch(e=>el('gs-connection').textContent=e.message),0);
  setInterval(()=>{if(document.contains(p))connectSheet().catch(e=>el('gs-connection').textContent=e.message);},15000);
  el('btn-stop').onclick=guarded(async()=>{await chrome.storage.local.set({isRunning:false});await saveLog('■ 작업 중단 · 결과 기록은 재시도 가능','INFO');await message({action:'SHEET_SYNC'});});
@@ -336,7 +336,7 @@ async function processTask() {
     createFloatingPanel();
 
     const data = await chrome.storage.local.get([
-      'accounts', 'currentIndex', 'albums', 'songs', 'albumIndex', 'songIndex', 'isRunning', 'step', 'waitRetry', 'runId', 'downloadWaitStartedAt', 'authSequence', 'mvs', 'artists', 'skipRequested'
+      'accounts', 'currentIndex', 'albums', 'songs', 'albumIndex', 'songIndex', 'isRunning', 'step', 'waitRetry', 'runId', 'downloadWaitStartedAt', 'authSequence', 'verifiedSession', 'mainTabId', 'mvs', 'artists', 'skipRequested'
     ]);
     if (!data.isRunning || data.step==='ACCOUNT_ROLLOVER' || !data.accounts || data.accounts.length === 0) {
       isStepRunning = false;
@@ -355,6 +355,7 @@ async function processTask() {
     const currentAccount = accounts[currentIndex];
     const currentUrl = window.location.href;
 
+    if(isPasswordChangeNotice())await recoverPasswordNoticeTab(data);
     if (isPasswordChangeNotice()&&!['CHECK_OR_LOGIN','NEXT_ACCOUNT_LOGIN','IDLE','AUTH_LOGOUT','AUTH_FORM','AUTH_WAIT'].includes(data.step)){if(window===window.top)await authCommand('AUTH_NOTICE_CONTINUE',data);return;}
     if (await handleAccountAuthentication(data)) return;
     if (await handlePayment(data)) return;
@@ -524,3 +525,19 @@ function updateLogExport(logs,running){
  const status=document.getElementById('gs-log-export-status');if(status){if(running)status.textContent='작업 중에는 전체 로그 보기·복사 가능 · 파일 저장은 중단 후 이용';else if(status.textContent.startsWith('작업 중에는'))status.textContent=text?'로그 파일 준비됨 · 로그 저장을 누르세요.':'저장할 로그가 없습니다.';}
 }
 
+
+async function recoverPasswordNoticeTab(data){
+ if(window!==window.top||!isPasswordChangeNotice()||!data.isRunning||skipMatchesAccount(data))return false;
+ const account=data.accounts?.[data.currentIndex||0],seq=data.authSequence,verified=data.verifiedSession;
+ const pending=data.step==='AUTH_WAIT'&&seq?.phase==='WAIT'&&seq.runId===data.runId&&seq.index===(data.currentIndex||0)&&seq.account===account?.id&&!!seq.submittedAt;
+ const confirmed=verified?.runId===data.runId&&verified.index===(data.currentIndex||0)&&verified.account===account?.id&&!!verified.memberNo;
+ if(!account||(!pending&&!confirmed))return false;
+ const tabs=await chrome.tabs.query({url:'*://*.genie.co.kr/*'});
+ const matches=tabs.filter(tab=>tab.active&&tab.url===window.location.href);
+ if(matches.length!==1)return false;const target=matches[0];if(target.id===data.mainTabId)return false;
+ const now=await chrome.storage.local.get(['isRunning','runId','currentIndex','songIndex','step','skipRequested','mainTabId']);
+ if(!now.isRunning||now.runId!==data.runId||(now.currentIndex||0)!==(data.currentIndex||0)||(now.songIndex||0)!==(data.songIndex||0)||now.step!==data.step||skipMatchesAccount(now))return false;
+ await chrome.storage.local.set({mainTabId:target.id});
+ await saveLog('로그인 안내 탭 연결 복구 → 서버 로그인 확인 후 전체 작업 주소로 이동','INFO');
+ return true;
+}
