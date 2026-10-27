@@ -299,7 +299,7 @@ const authLoginUrl='https://www.genie.co.kr/member/popLogin?page_rfr='+encodeURI
 async function accountAuthRequest(msg,sender) {
   if(msg.action==='AUTH_OWNER'){const d=await chrome.storage.local.get(['mainTabId']);return {ok:sender.frameId===0&&sender.tab?.id===d.mainTabId};}
   return withStateLock(async()=>{
-    const data=await chrome.storage.local.get(['isRunning','runId','currentIndex','songIndex','accounts','albums','songs','mvs','artists','step','mainTabId','verifiedSession','previousSession','authSequence','accountMemberBindings']);
+    const data=await chrome.storage.local.get(['isRunning','runId','currentIndex','songIndex','accounts','albums','songs','mvs','artists','step','albumIndex','mainTabId','verifiedSession','previousSession','authSequence','accountMemberBindings']);
     if (msg.action==='AUTH_OWNER') return {ok:sender.frameId===0 && sender.tab?.id===data.mainTabId};
     if (!msg.expected || !sameTask(data,msg.expected)) return {ok:false};
     if (msg.action==='AUTH_ASSERT') return {ok:await assertVerifiedSession(data)};
@@ -308,6 +308,15 @@ async function accountAuthRequest(msg,sender) {
     const probe=async()=>{const session=await readServerSession();const now=await chrome.storage.local.get(['isRunning','runId','currentIndex','songIndex','step','skipRequested']);if(skipMatchesAccount(now)||!sameTask(now,data)||now.step!==data.step){const error=new Error('stale auth');error.stale=true;throw error;}return session;};
     const account=data.accounts?.[data.currentIndex||0]; if(!account)return stopAccountAuth('대상 계정이 없습니다',data);
     try {
+      if(msg.action==='AUTH_NOTICE_CONTINUE'){
+        let source;try{source=new URL(sender.url);}catch{return {ok:false};}
+        if(source.hostname!=='www.genie.co.kr'||!/^\/member\/info\/myInfoPwdChangeMsg\/?$/i.test(source.pathname))return {ok:false};
+        const target=verifiedStageUrl(data);if(!target)return {ok:false};
+        if(!await assertAccountLease(data,true)||!await assertVerifiedSession(data,true))return {ok:false};
+        const current=await chrome.storage.local.get(['isRunning','runId','currentIndex','songIndex','step','skipRequested']);if(!sameTask(current,data)||current.step!==data.step||skipMatchesAccount(current))return {ok:false};
+        await appendLog('INFO','비밀번호 변경 안내 페이지 → 확인된 작업의 전체 주소로 이동');
+        await navigateMainTab(target);return {ok:true,navigated:true,url:target};
+      }
       if(msg.action==='AUTH_BEGIN') {
         if(!['CHECK_OR_LOGIN','NEXT_ACCOUNT_LOGIN','IDLE'].includes(data.step))return {ok:false};
         const context=(await chrome.storage.local.get(['sheetContext'])).sheetContext;if(context)await sheetApi('heartbeat',{...context,accounts:[data.accounts?.[data.currentIndex||0]?.id]});
@@ -353,7 +362,8 @@ async function accountAuthRequest(msg,sender) {
         const url='https://www.genie.co.kr/detail/'+({mv:'mediaInfo?xvnm=',artist:'artistInfo?xxnm=',album:'albumInfo?axnm=',song:'songInfo?xgnm='}[stage])+encodeURIComponent(({mv:data.mvs,artist:data.artists,album:data.albums,song:data.songs}[stage])[0]);
         await chrome.storage.local.set({verifiedSession:{runId:data.runId,index:data.currentIndex||0,account:account.id,memberNo:session.memberNo},accountMemberBindings:bindings,step,albumIndex:0,songIndex:0,waitRetry:0,authSequence:{...seq,phase:'VERIFIED'}});
         await appendLog('SUCCESS','대상 계정 로그인 흐름 및 서버 회원 세션 확인 완료 → 작업 진행');
-        return {ok:true,url};
+        const current=await chrome.storage.local.get(['isRunning','runId','currentIndex','songIndex','step','skipRequested']);if(!sameTask(current,data)||current.step!==step||skipMatchesAccount(current))return {ok:false};
+        await navigateMainTab(url);return {ok:true,navigated:true,url};
       }
       return {ok:false};
     } catch(error) { if(error.stale)return {ok:false};return stopAccountAuth(error.name==='AbortError'?'서버 로그인 확인 시간 초과':error.message,data); }
@@ -469,4 +479,10 @@ async function failAccountAndAdvance(message,data){
  const now=await chrome.storage.local.get(['isRunning','runId','currentIndex','songIndex','step']);if(!sameTask(now,data)||now.step==='ACCOUNT_ROLLOVER')return {ok:false};
  await appendLog('ERROR',message+' → 다음 계정으로 넘김');
  await performAccountRollover(message,true,data);return {ok:false,advanced:true};
+}
+
+function verifiedStageUrl(data){
+ const routes={MV_LIKE:['mediaInfo','xvnm',data.mvs?.[0]],ARTIST_LIKE:['artistInfo','xxnm',data.artists?.[0]],ALBUM_LIKE:['albumInfo','axnm',data.albums?.[data.albumIndex||0]],SONG_LIKE:['songInfo','xgnm',data.songs?.[data.songIndex||0]],SONG_DOWNLOAD:['songInfo','xgnm',data.songs?.[data.songIndex||0]]};
+ const route=routes[data.step];if(!route||!/^\d+$/.test(String(route[2]||'')))return null;
+ return 'https://www.genie.co.kr/detail/'+route[0]+'?'+route[1]+'='+encodeURIComponent(route[2]);
 }
