@@ -1,10 +1,10 @@
 {
   "schema": 1,
   "loaderApi": 2,
-  "version": "10.0.13",
+  "version": "10.0.14",
   "content": {
-    "file": "genie-content-10.0.13.js",
-    "sha256": "c7827634dca44af777705df8189f687495b0e70970ce77ff8dafe1df1c5430da"
+    "file": "genie-content-10.0.14.js",
+    "sha256": "3c75fb5b8cc2c46c069858be2cba71a02e68bd7b8040fac308198dfe093a449c"
   },
   "engine": {
     "file": "genie-engine-10.0.13.js",

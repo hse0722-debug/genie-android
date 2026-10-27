@@ -143,7 +143,7 @@ async function createFloatingPanel(){
  #genie-helper-dashboard details[open]>summary{margin-bottom:8px}
  #genie-helper-dashboard .gs-details-table{max-height:160px;overflow:auto}
  </style>
- <header id="dash-header" style="padding:12px 14px;background:#0b3768;color:white;display:flex;align-items:center;justify-content:space-between;touch-action:none"><strong>지니 다운 도우미 <small style="display:inline;color:#c6e5ff">${globalThis.__genieRuntimeVersion||'10.0.13'}</small></strong><button id="gs-hide" style="background:transparent">숨기기</button></header>
+ <header id="dash-header" style="padding:12px 14px;background:#0b3768;color:white;display:flex;align-items:center;justify-content:space-between;touch-action:none"><strong>지니 다운 도우미 <small style="display:inline;color:#c6e5ff">${globalThis.__genieRuntimeVersion||'10.0.14'}</small></strong><button id="gs-hide" style="background:transparent">숨기기</button></header>
  <div class="gs-card"><h3>구글 시트 연결</h3><details id="gs-address-settings" ${d.sheetConfig?.endpoint?'':'open'}><summary>연결 주소 설정</summary><div id="gs-settings"><label>Apps Script 웹 앱 주소</label><input id="gs-endpoint" placeholder="https://script.google.com/macros/s/…/exec"></div><label style="margin-top:7px">계정 시트 주소</label><input id="gs-url" placeholder="gid가 포함된 시트 탭 주소"><button id="gs-save" style="margin:7px 0">연결 설정 저장</button></details><div class="gs-row" style="margin-top:7px"><div><label>작업 시간</label><select id="gs-time"></select></div><div><label>담당 헬퍼</label><select id="gs-helper"></select></div></div><small id="gs-connection">시트 자동 연결</small></div>
  <div class="gs-card gs-current"><div class="gs-row" style="justify-content:space-between"><span style="font-size:12px">현재 작업 중인 아이디</span><b id="gs-current-state" style="font-size:12px;color:#07519c">대기</b></div><div id="gs-current-account">작업 대기</div><small id="gs-current-location">시트 연결 후 시작하세요.</small><div id="dash-summary" class="gs-status" style="margin-top:5px"></div></div>
  <div class="gs-card"><h3>시트 계정 현황</h3><table><thead><tr><th style="width:36px">행</th><th style="width:40px">번호</th><th>아이디</th><th style="width:78px">상태</th></tr></thead><tbody id="gs-account-list"></tbody></table><small>대기 계정 수정 → 다음 계정 시작 전 반영<br>현재 작업 계정 수정 → 중단 후 반영</small></div>
@@ -161,7 +161,7 @@ async function createFloatingPanel(){
  const connectSheet=async()=>{if(connecting||!endpointSaved||(await chrome.storage.local.get(['isRunning'])).isRunning)return;connecting=true;try{const previous={time:el('gs-time').value,helper:el('gs-helper').value};gsCatalog=await message({action:'SHEET_CATALOG',url:el('gs-url').value.trim()});fill(previous);await selectSheet();}finally{connecting=false;}};
  el('gs-save').onclick=guarded(async()=>{await idle();await message({action:'SHEET_PREPARE_CHANGE'});await chrome.storage.local.set({sheetConfig:{endpoint:el('gs-endpoint').value.trim()}});endpointSaved=true;await connectSheet();await loadSheetSeeds();el('gs-address-settings').open=false;});
  el('gs-time').onchange=guarded(async()=>{helpersForTime();await selectSheet();});el('gs-helper').onchange=guarded(selectSheet);el('gs-url').onchange=guarded(connectSheet);
- el('btn-resume').onclick=guarded(async()=>{setLogExportRunning(true);await idle();await selectSheet();const r=await message({action:'SHEET_START'});await saveLog('▶ 시트 계정 자동화 시작 · 작업 코드 '+(globalThis.__genieRuntimeVersion||'10.0.13'),'INFO');navigateTask(r.url||'https://www.genie.co.kr/',true);});
+ el('btn-resume').onclick=guarded(async()=>{setLogExportRunning(true);await idle();await selectSheet();const r=await message({action:'SHEET_START'});await saveLog('▶ 시트 계정 자동화 시작 · 작업 코드 '+(globalThis.__genieRuntimeVersion||'10.0.14'),'INFO');navigateTask(r.url||'https://www.genie.co.kr/',true);});
  setTimeout(()=>connectSheet().catch(e=>el('gs-connection').textContent=e.message),0);
  setInterval(()=>{if(document.contains(p))connectSheet().catch(e=>el('gs-connection').textContent=e.message);},15000);
  el('btn-stop').onclick=guarded(async()=>{await chrome.storage.local.set({isRunning:false});await saveLog('■ 작업 중단 · 결과 기록은 재시도 가능','INFO');await message({action:'SHEET_SYNC'});});
@@ -269,52 +269,31 @@ function actionable(el) {
   return Boolean(el && el.getClientRects().length && !el.disabled && el.getAttribute('aria-disabled') !== 'true');
 }
 
-// 결제창은 앞으로만 진행합니다. 버튼 클릭 후 동일 함수를 다시 호출하지 않습니다.
+// Payment pages require manual review. Never click purchase or consent controls.
+function isPaymentReviewPage() {
+  return window.location.hostname === 'pay.genie.co.kr' ||
+    /^\/buy\//i.test(window.location.pathname) ||
+    Boolean(document.querySelector('#btnPaySong, #name-genie, #name-agree, #name-payment, a[onclick*="fnCashPay"]'));
+}
+async function stopAndPreserveError(reason, expected) {
+  const state = await chrome.storage.local.get(['isRunning','runId','currentIndex','accounts','step','logs']);
+  if (!state.isRunning || (expected && (state.runId !== expected.runId ||
+      (state.currentIndex || 0) !== (expected.currentIndex || 0)))) return false;
+  const account = state.accounts?.[state.currentIndex || 0];
+  const failure = {at:new Date().toISOString(), accountId:account?.id || 'System',
+    row:account?.row ?? null, currentIndex:state.currentIndex || 0,
+    runId:state.runId || '', step:state.step || '',
+    page:window.location.origin + window.location.pathname, reason:String(reason)};
+  const line = `[${new Date().toLocaleTimeString('ko-KR',{hour12:false})}] [ERROR] (${failure.accountId}) ${failure.reason} · 자동 작업 중단 · 현재 계정 보존`;
+  // Persist the stop, account snapshot and log together without contacting the main tab or Sheets.
+  await chrome.storage.local.set({isRunning:false, lastStoppedError:failure,
+    logs:[...(state.logs || []),line], lastActionText:line});
+  return true;
+}
 async function handlePayment(data) {
-  if (!['SONG_DOWNLOAD', 'PAY_POPUP_STEP1', 'WAIT_DOWNLOAD_STREAM'].includes(data.step)) return false;
-  if (data.step === 'WAIT_DOWNLOAD_STREAM') return false;
-  const cash = document.querySelector('input#name-genie[name="selectPay"][value="8"], #name-genie');
-  const agree = document.querySelector('input#name-agree');
-  const purchase = document.querySelector('input#name-payment');
-  const finalSelector = 'a.def-btn.radius.btn-blue[onclick*="fnCashPay"], a[onclick*="fnCashPay"]';
-  const final = document.querySelector(finalSelector);
-  const controls = [cash, agree, purchase].filter(actionable);
-  if (controls.length || actionable(final)) {
-    if (!(await authCommand('AUTH_ASSERT',data))?.ok) return true;
-    let changed = false;
-    for (const control of controls) {
-      if (!control.checked) { control.click(); changed = true; }
-    }
-    if (changed) await saveLog('[결제 2~4단계] 지니캐시 선택 및 약관·구매 동의 체크', 'INFO');
-    const button = document.querySelector(finalSelector);
-    if (controls.some(el => !el.checked) || !actionable(button)) return false;
-    if (!await claimTaskAction('PAY_FINAL', data)) return false;
-    // 기존 최종 결제 전 대기시간을 유지하고, 중단/계정 변경 시 클릭하지 않습니다.
-    await taskDelay(900);
-    if (!await isTaskCurrent(data)) return true;
-    const readyButton = document.querySelector(finalSelector);
-    const currentControls = [
-      document.querySelector('input#name-genie[name="selectPay"][value="8"], #name-genie'),
-      document.querySelector('input#name-agree'), document.querySelector('input#name-payment')
-    ].filter(actionable);
-    if (!actionable(readyButton) || currentControls.some(el => !el.checked)) {
-      await chrome.storage.local.set({ isRunning: false });
-      await saveLog('결제 화면이 변경되어 중단했습니다. 화면 확인 후 다시 시작해주세요.', 'ERROR');
-      return true;
-    }
-    if(!(await authCommand('AUTH_FINAL_GUARD',data))?.ok || !actionable(readyButton) || currentControls.some(el=>!el.checked))return true;
-    await saveLog('[결제 최종단계] "결제하기" 버튼 1회 클릭 → 다운로드 대기', 'INFO');
-    if (await isTaskCurrent(data, ['WAIT_DOWNLOAD_STREAM'])) readyButton.click();
-    return true;
-  }
-  const first = document.querySelector('#btnPaySong');
-  if (data.step === 'SONG_DOWNLOAD' && actionable(first) && await claimTaskAction('PAY_SONG', data)) {
-    if (!await isTaskCurrent(data, ['PAY_POPUP_STEP1'])) return true;
-    await saveLog('[결제 1단계] 개별 곡 결제하기 버튼 1회 클릭', 'INFO');
-    if (await isTaskCurrent(data, ['PAY_POPUP_STEP1'])) first.click();
-    return true;
-  }
-  return false;
+  if (!isPaymentReviewPage()) return false;
+  await stopAndPreserveError('결제 화면 감지: 직접 확인이 필요합니다',data);
+  return true;
 }
 
 let navigationPending = false,documentLeaving=false;
@@ -331,6 +310,7 @@ let isStepRunning = false;
 async function processTask() {
   if (isStepRunning || navigationPending) return;
   isStepRunning = true;
+  let taskSnapshot;
 
   try {
     createFloatingPanel();
@@ -343,6 +323,15 @@ async function processTask() {
       return;
     }
 
+    taskSnapshot = data;
+    if (await handlePayment(data)) return;
+    if (['SONG_DOWNLOAD','PAY_POPUP_STEP1','WAIT_DOWNLOAD_STREAM'].includes(data.step)) {
+      const since = data.downloadWaitStartedAt;
+      if (since && Date.now() - since > 30000) {
+        await stopAndPreserveError('결제/다운로드 응답 대기 30초 초과',data);
+        return;
+      }
+    }
     const { accounts, currentIndex, albums, songs, albumIndex, songIndex, step } = data;
     if (currentIndex >= accounts.length) {
       await chrome.storage.local.set({ isRunning: false, step: 'IDLE' });
@@ -358,13 +347,12 @@ async function processTask() {
     if(isPasswordChangeNotice())await recoverPasswordNoticeTab(data);
     if (isPasswordChangeNotice()&&!['CHECK_OR_LOGIN','NEXT_ACCOUNT_LOGIN','IDLE','AUTH_LOGOUT','AUTH_FORM','AUTH_WAIT'].includes(data.step)){if(window===window.top)await authCommand('AUTH_NOTICE_CONTINUE',data);return;}
     if (await handleAccountAuthentication(data)) return;
-    if (await handlePayment(data)) return;
     if (window !== window.top) return;
     if (!(await chrome.runtime.sendMessage({action:'AUTH_OWNER'}))?.ok) return;
     const waitKey=[data.runId,currentIndex,step,data.albumIndex||0,data.songIndex||0].join(':');
     const waiting=(await chrome.storage.local.get(['taskWaitState'])).taskWaitState;
     if(waiting?.key!==waitKey)await chrome.storage.local.set({taskWaitState:{key:waitKey,at:Date.now()}});
-    else if(Date.now()-waiting.at>120000){await saveLog('작업 단계 2분간 진행 없음 → 다음 계정 넘김','ERROR');await chrome.runtime.sendMessage({action:'FORCE_ROLLOVER',reason:'작업 단계 진행 시간 초과',expected:{runId:data.runId,currentIndex:currentIndex||0,songIndex:data.songIndex||0}});return;}
+    else if(Date.now()-waiting.at>120000){await stopAndPreserveError('작업 단계 2분간 진행 없음',data);return;}
 
 
     if(['MV_LIKE','ARTIST_LIKE'].includes(step)){
@@ -456,9 +444,7 @@ async function processTask() {
       if (window !== window.top) return;
       const retry = (data.waitRetry || 0) + 1;
       if (retry > 25) {
-        await saveLog(`❌ 결제/다운로드 대기 시간 초과 -> 다음 계정 스킵`, 'ERROR');
-        await chrome.runtime.sendMessage({ action: 'FORCE_ROLLOVER', reason: '결제/다운로드 타임아웃',
-          expected: { runId: data.runId, currentIndex: data.currentIndex || 0, songIndex: data.songIndex || 0 } });
+        await stopAndPreserveError('결제/다운로드 대기 시간 초과',data);
       } else {
         await chrome.storage.local.set({ waitRetry: retry });
       }
@@ -468,7 +454,7 @@ async function processTask() {
 
 
   } catch (err) {
-    if(!expectedNavigationError(err))await saveLog(`❌ 오류 발생: ${err.message}`, 'ERROR');
+    if(!expectedNavigationError(err))await stopAndPreserveError(`연결 또는 작업 오류: ${err.message}`, taskSnapshot);
   } finally {
     isStepRunning = false;
   }
