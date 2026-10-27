@@ -370,7 +370,8 @@ async function skipAccount(expected,sender){
  if(sender.frameId!==0||(data.isRunning&&sender.tab?.id!==data.mainTabId))return {ok:false,error:'메인 리모컨에서 넘겨주세요.'};
  const account=data.accounts?.[data.currentIndex||0];if(!account)return {ok:false,error:'넘길 계정이 없습니다.'};
  if(data.isRunning){await chrome.storage.local.set({step:'SKIP_ACCOUNT_PENDING'});await performAccountRollover('사용자 ▷ 넘기기',true,data);}
- else{const done=(await chrome.storage.local.get(['sheetCompletedIds'])).sheetCompletedIds||[];await chrome.storage.local.set({sheetCompletedIds:[...new Set([...done,account.id])]});const results=data.accountResults||{};results[account.id]||={};for(const metric of ['album','song','down','mv','artist']){const enabled={album:data.albums?.length,song:data.songs?.length,down:data.songs?.length,mv:data.mvs?.length,artist:data.artists?.length}[metric];if(enabled&&!['o','x'].includes(results[account.id][metric]))results[account.id][metric]='x';}await chrome.storage.local.set({accountResults:results,currentIndex:(data.currentIndex||0)+1,albumIndex:0,songIndex:0,step:'CHECK_OR_LOGIN',verifiedSession:null,authSequence:null});await appendLog('INFO','▷ '+account.id+' 계정 넘기기 · 다음 시작 위치 저장');}
+ else{const snapshot=await chrome.storage.local.get(null);const done=[...new Set([...progressIds(snapshot,snapshot.sheetSelection),account.id])];await saveProgress(snapshot,snapshot.sheetSelection,done);await chrome.storage.local.set({currentIndex:(data.currentIndex||0)+1,albumIndex:0,songIndex:0,step:'CHECK_OR_LOGIN',verifiedSession:null,authSequence:null});await appendLog('INFO','▷ '+account.id+' 계정 넘기기 · 다음 시작 위치 저장');}
+
  return {ok:true};
 }
 
@@ -380,9 +381,22 @@ async function ensureClientId(){const d=await chrome.storage.local.get(['sheetCl
 async function sheetApi(action,extra={}){
  const d=await chrome.storage.local.get(['sheetConfig','sheetSelection','accounts','currentIndex','isRunning','step']);const c=d.sheetConfig;
  if(!c?.endpoint)throw Error('웹 앱 주소를 저장하세요.');if(!/^https:\/\/script\.google\.com\/macros\/s\/[\w-]+\/exec$/.test(c.endpoint))throw Error('Apps Script /exec 주소를 입력하세요.');
- const start=Date.now(),response=await fetch(c.endpoint,{method:'POST',body:JSON.stringify({action,clientId:await ensureClientId(),helper:d.sheetSelection?.helper||'',accountId:d.accounts?.[d.currentIndex||0]?.id||'',isRunning:!!d.isRunning,step:d.step,...extra})});
- if(!response.ok)throw Error('시트 응답 오류 ('+response.status+')');let result;try{result=await response.json();}catch{throw Error('웹 앱 새 버전 배포와 접근 권한을 확인하세요.');}if(!result.ok)throw Error(result.error||'시트 요청 실패');return {...result,elapsedMs:Date.now()-start};
+ const start=Date.now(),payload=JSON.stringify({action,clientId:await ensureClientId(),helper:d.sheetSelection?.helper||'',accountId:d.accounts?.[d.currentIndex||0]?.id||'',isRunning:!!d.isRunning,step:d.step,...extra});
+ const retryable=['catalog','accounts','seeds','heartbeat'].includes(action),attempts=retryable?3:1;
+ for(let attempt=0;attempt<attempts;attempt++){
+  let response;
+  try{response=await fetch(c.endpoint,{method:'POST',body:payload});}catch(error){if(attempt+1>=attempts)throw error;await new Promise(resolve=>setTimeout(resolve,400*(attempt+1)));continue;}
+  if(!response.ok){if(retryable&&[429,500,502,503,504].includes(response.status)&&attempt+1<attempts){await new Promise(resolve=>setTimeout(resolve,400*(attempt+1)));continue;}throw Error('시트 응답 오류 ('+response.status+')');}
+  let result;try{result=await response.json();}catch{throw Error('웹 앱 새 버전 배포와 접근 권한을 확인하세요.');}if(!result.ok)throw Error(result.error||'시트 요청 실패');return {...result,elapsedMs:Date.now()-start};
+ }
 }
+function selectionKey(selection){return selection?JSON.stringify([String(selection.spreadsheetId||''),String(selection.gid??''),String(selection.time||''),String(selection.helper||'')]):'';}
+function progressIds(d,selection){
+ const same=selectionKey(d.sheetSelection)===selectionKey(selection),stored=d.sheetProgress?.[selectionKey(selection)]||[];
+ const prefix=same?(d.accounts||[]).slice(0,d.currentIndex||0).map(a=>a.id):[];
+ return [...new Set([...stored,...(same?(d.sheetCompletedIds||[]):[]),...prefix])];
+}
+async function saveProgress(d,selection,ids){const progress={...(d.sheetProgress||{}),[selectionKey(selection)]:[...new Set(ids)]};await chrome.storage.local.set({sheetProgress:progress,sheetCompletedIds:progress[selectionKey(selection)]});}
 function seedValues(s){return {albums:s.album.sid?[s.album.sid]:[],songs:s.song.sid?[s.song.sid]:[],mvs:s.mv.sid?[s.mv.sid]:[],artists:s.artist.sid?[s.artist.sid]:[],sheetAlbumName:s.album.name,sheetSongName:s.song.name,sheetMvName:s.mv.name,sheetArtistName:s.artist.name,sheetSeedsFetchedAt:Date.now()};}
 function accountValues(rows){return rows.map(r=>({id:r.id,pw:r.password,row:r.row}));}
 async function sheetCommand(msg){
@@ -393,15 +407,24 @@ async function sheetCommand(msg){
  if(msg.action==='SHEET_SELECT'){
  const source=accountSheetRef(msg.url),selection={...source,helper:msg.helper,time:msg.time,credentialMode:'row-password'};
  if(!selection.helper||!selection.time)throw Error('시간과 헬퍼를 선택하세요.');
- const changed=JSON.stringify(selection)!==JSON.stringify(d.sheetSelection);
- if(changed){const sync=await sheetTick(true);if(!sync.ok)throw Error(sync.error);await chrome.storage.local.set({sheetSelection:selection,sheetCompletedIds:[],accounts:[],currentIndex:0,sheetContext:null,accountResults:{},sheetSynced:{}});}
- const fresh=await sheetApi('accounts',selection);const done=new Set(changed?[]:(d.sheetCompletedIds||[]));const accounts=accountValues(fresh.accounts.filter(r=>!done.has(r.id)));
- await chrome.storage.local.set({accounts,currentIndex:0,sheetExcluded:fresh.excluded,sheetLiveAt:Date.now()});return {ok:true,count:accounts.length};
+ const changed=selectionKey(selection)!==selectionKey(d.sheetSelection);
+ const sync=await sheetTick(true);if(!sync.ok)throw Error(sync.error);
+ let snapshot=await chrome.storage.local.get(null);if(changed&&snapshot.sheetSelection){await saveProgress(snapshot,snapshot.sheetSelection,progressIds(snapshot,snapshot.sheetSelection));snapshot=await chrome.storage.local.get(null);}
+ const ids=progressIds(snapshot,selection);
+ const fresh=await sheetApi('accounts',selection),done=new Set(ids),accounts=accountValues(fresh.accounts.filter(r=>!done.has(r.id)));
+ await saveProgress(snapshot,selection,ids);
+ await chrome.storage.local.set({sheetSelection:selection,accounts,currentIndex:0,sheetExcluded:fresh.excluded,sheetLiveAt:Date.now(),...(changed?{sheetContext:null,accountResults:{},sheetSynced:{}}:{})});return {ok:true,count:accounts.length};
  }
+ if(msg.action==='SHEET_NEW_RUN'){
+ const sync=await sheetTick(true);if(!sync.ok)throw Error(sync.error);const now=await chrome.storage.local.get(null);if(!now.sheetSelection)throw Error('시간과 헬퍼를 먼저 선택하세요.');
+ await saveProgress(now,now.sheetSelection,[]);await chrome.storage.local.set({accounts:[],currentIndex:0,accountResults:{},sheetSynced:{},sheetContext:null});return {ok:true};
+ }
+
  if(msg.action!=='SHEET_START')throw Error('지원하지 않는 시트 요청');
  const sync=await sheetTick(true);if(!sync.ok)throw Error(sync.error);const latest=await chrome.storage.local.get(null),selection=latest.sheetSelection;if(!selection)throw Error('시트 연결 설정과 시간·헬퍼를 선택하세요.');
- const fresh=await sheetApi('accounts',selection),completed=latest.sheetCompletedIds||[],done=new Set(completed);let accounts=accountValues(fresh.accounts.filter(r=>!done.has(r.id)));
- if(!accounts.length){accounts=accountValues(fresh.accounts);if(!accounts.length)throw Error('선택 범위에 J열 비밀번호가 있는 계정이 없습니다.');await chrome.storage.local.set({sheetCompletedIds:[]});}
+ const fresh=await sheetApi('accounts',selection),completed=progressIds(latest,selection),done=new Set(completed);let accounts=accountValues(fresh.accounts.filter(r=>!done.has(r.id)));
+ if(!accounts.length)throw Error('남은 계정이 없습니다. 전체를 다시 작업하려면 상세 결과의 새 작업을 선택하세요.');
+ await saveProgress(latest,selection,completed);
  const runId=crypto.randomUUID(),context={...selection,jobId:runId,accounts:accounts.map(a=>a.id)};
  const result=await sheetApi('start',{...context,accounts:[accounts[0].id]});const seeds=seedValues(result.seeds);
  if(![seeds.albums,seeds.songs,seeds.mvs,seeds.artists].some(x=>x.length)){await sheetApi('release',{...context,accounts:[accounts[0].id]});throw Error('시드를 하나 이상 입력하세요.');}
@@ -411,7 +434,7 @@ async function sheetCommand(msg){
 }
 function unsentChanges(d){const enabled={album:d.albums?.length,song:d.songs?.length,down:d.songs?.length,mv:d.mvs?.length,artist:d.artists?.length};const out=[];for(const id of d.sheetContext?.accounts||[])for(const metric of ['down','song','mv','album','artist']){const value=d.accountResults?.[id]?.[metric];if(enabled[metric]&&['o','x'].includes(value)&&d.sheetSynced?.[id+':'+metric]!==value)out.push({id,metric,value});}return out;}
 async function sheetTick(force=false){
- if(sheetTickBusy)return {ok:false,error:'시트 기록 처리 중입니다. 잠시 후 다시 시도하세요.'};const owner=(await chrome.storage.local.get(['sheetEngineOwner'])).sheetEngineOwner;if(!force&&owner!==engineToken)return {ok:true};sheetTickBusy=true;
+ if(sheetTickBusy){if(!force)return {ok:true,busy:true};const until=Date.now()+35000;while(sheetTickBusy){if(Date.now()>until)return {ok:false,error:'시트 기록 처리 중입니다. 잠시 후 다시 시도하세요.'};await new Promise(resolve=>setTimeout(resolve,50));}}const owner=(await chrome.storage.local.get(['sheetEngineOwner'])).sheetEngineOwner;if(!force&&owner!==engineToken)return {ok:true};sheetTickBusy=true;
  try{const d=await chrome.storage.local.get(null);if(!d.sheetContext)return {ok:true};const synced=d.sheetSynced||{},changes=unsentChanges(d);const current=d.accounts?.[d.currentIndex||0];
  if(d.isRunning&&current)await sheetApi('heartbeat',{...d.sheetContext,accounts:[current.id]});
  if(changes.length){for(let i=0;i<changes.length;i+=100){const batch=changes.slice(i,i+100);await sheetApi('write',{...d.sheetContext,accounts:[...new Set(batch.map(c=>c.id))],changes:batch});for(const c of batch)synced[c.id+':'+c.metric]=c.value;await chrome.storage.local.set({sheetSynced:synced});}}
@@ -430,7 +453,8 @@ async function nextSheetAccounts(data,state){
  const d=await chrome.storage.local.get(null),context=d.sheetContext;if(!context)return data.accounts;
  const id=data.accounts?.[data.currentIndex||0]?.id;const sync=await sheetTick(true);if(!sync.ok)throw Error(sync.error);
  await sheetApi('status',{...context,accounts:[id],state});
- const completed=[...new Set([...(d.sheetCompletedIds||[]),id])];const fresh=await sheetApi('accounts',d.sheetSelection);const done=new Set(completed),prefix=data.accounts.slice(0,(data.currentIndex||0)+1),remaining=accountValues(fresh.accounts.filter(r=>!done.has(r.id))),accounts=[...prefix,...remaining];
+ const checkpoint=await chrome.storage.local.get(null);if(!sameTask(checkpoint,data))throw Error('작업이 중단되거나 변경되었습니다.');
+ const completed=[...new Set([...progressIds(checkpoint,d.sheetSelection),id])];await saveProgress(checkpoint,d.sheetSelection,completed);const fresh=await sheetApi('accounts',d.sheetSelection);const done=new Set(completed),prefix=data.accounts.slice(0,(data.currentIndex||0)+1),remaining=accountValues(fresh.accounts.filter(r=>!done.has(r.id))),accounts=[...prefix,...remaining];
  const latest=await chrome.storage.local.get(null);if(!sameTask(latest,data))throw Error('작업이 중단되거나 변경되었습니다.');
  await chrome.storage.local.set({sheetCompletedIds:completed,accounts,sheetContext:{...context,accounts:accounts.map(a=>a.id)},sheetLiveAt:Date.now()});return accounts;
 }

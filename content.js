@@ -140,12 +140,12 @@ async function createFloatingPanel(){
  #genie-helper-dashboard details[open]>summary{margin-bottom:8px}
  #genie-helper-dashboard .gs-details-table{max-height:160px;overflow:auto}
  </style>
- <header id="dash-header" style="padding:12px 14px;background:#0b3768;color:white;display:flex;align-items:center;justify-content:space-between;touch-action:none"><strong>지니 다운 도우미 <small style="display:inline;color:#c6e5ff">${globalThis.__genieRuntimeVersion||'10.0.6'}</small></strong><button id="gs-hide" style="background:transparent">숨기기</button></header>
+ <header id="dash-header" style="padding:12px 14px;background:#0b3768;color:white;display:flex;align-items:center;justify-content:space-between;touch-action:none"><strong>지니 다운 도우미 <small style="display:inline;color:#c6e5ff">${globalThis.__genieRuntimeVersion||'10.0.7'}</small></strong><button id="gs-hide" style="background:transparent">숨기기</button></header>
  <div class="gs-card"><h3>구글 시트 연결</h3><details id="gs-address-settings" ${d.sheetConfig?.endpoint?'':'open'}><summary>연결 주소 설정</summary><div id="gs-settings"><label>Apps Script 웹 앱 주소</label><input id="gs-endpoint" placeholder="https://script.google.com/macros/s/…/exec"></div><label style="margin-top:7px">계정 시트 주소</label><input id="gs-url" placeholder="gid가 포함된 시트 탭 주소"><button id="gs-save" style="margin:7px 0">연결 설정 저장</button></details><div class="gs-row" style="margin-top:7px"><div><label>작업 시간</label><select id="gs-time"></select></div><div><label>담당 헬퍼</label><select id="gs-helper"></select></div></div><small id="gs-connection">시트 자동 연결</small></div>
  <div class="gs-card gs-current"><div class="gs-row" style="justify-content:space-between"><span style="font-size:12px">현재 작업 중인 아이디</span><b id="gs-current-state" style="font-size:12px;color:#07519c">대기</b></div><div id="gs-current-account">작업 대기</div><small id="gs-current-location">시트 연결 후 시작하세요.</small><div id="dash-summary" class="gs-status" style="margin-top:5px"></div></div>
  <div class="gs-card"><h3>시트 계정 현황</h3><table><thead><tr><th style="width:42px">행</th><th>아이디</th><th style="width:78px">상태</th></tr></thead><tbody id="gs-account-list"></tbody></table><small>대기 계정 수정 → 다음 계정 시작 전 반영<br>현재 작업 계정 수정 → 중단 후 반영</small></div>
  <div class="gs-card"><h3>작업 대상</h3><div class="gs-targets">${[['artist','가수'],['album','앨범'],['mv','뮤비'],['song','곡']].map(([key,label])=>`<div><b>${label}</b> <span id="gs-${key}-name"></span><span class="gs-sid" id="gs-${key}-separator"></span><span class="gs-sid" id="gs-${key}-sid"></span></div>`).join('')}</div><div id="sheet-seed-status" class="gs-status"></div><div class="gs-actions"><button id="btn-resume">▶ 시작</button><button id="btn-stop" style="background:#a34545">■ 중단</button><button id="btn-skip" style="background:#647b96">▷ 넘기기</button></div></div>
- <div style="margin:8px 12px"><details id="gs-result-details"><summary>상세 결과·기록 상태</summary><div class="gs-details-table"><table><thead><tr>${['아이디','다운','곡','뮤비','앨범','가수'].map(v=>`<th>${v}</th>`).join('')}</tr></thead><tbody id="dash-table-body"></tbody></table></div><small>E~I열 결과 자동 기록 · 다운 o = 다운로드 시작 감지</small><div id="gs-sync" class="gs-status"></div><button id="gs-sync-now" style="margin-top:7px">결과 기록 재시도</button> <button id="gs-backlog-export" style="margin-top:7px;background:#647b96">미기록 결과 저장</button></details><details style="margin-top:7px"><summary>작업 알림·로그</summary><div id="dash-last-log" class="gs-status">대기 중</div><div id="dash-log-box" style="max-height:140px;overflow:auto;font-size:11px"></div><button id="gs-log" style="margin-top:7px">로그 저장</button></details></div>`;
+ <div style="margin:8px 12px"><details id="gs-result-details"><summary>상세 결과·기록 상태</summary><button id="gs-new-run" style="margin-bottom:7px;background:#647b96">새 작업 · 전체 다시 진행</button><div class="gs-details-table"><table><thead><tr>${['아이디','다운','곡','뮤비','앨범','가수'].map(v=>`<th>${v}</th>`).join('')}</tr></thead><tbody id="dash-table-body"></tbody></table></div><small>E~I열 결과 자동 기록 · 다운 o = 다운로드 시작 감지</small><div id="gs-sync" class="gs-status"></div><button id="gs-sync-now" style="margin-top:7px">결과 기록 재시도</button> <button id="gs-backlog-export" style="margin-top:7px;background:#647b96">미기록 결과 저장</button></details><details style="margin-top:7px"><summary>작업 알림·로그</summary><div id="dash-last-log" class="gs-status">대기 중</div><div id="dash-log-box" style="max-height:140px;overflow:auto;font-size:11px"></div><button id="gs-log" style="margin-top:7px">로그 저장</button></details></div>`;
  document.body.appendChild(p);const el=id=>document.getElementById(id);el('gs-endpoint').value=d.sheetConfig?.endpoint||'';el('gs-url').value=d.sheetCatalog?.url||'https://docs.google.com/spreadsheets/d/14SWMDCFfxYGFAuoTMxahDKTcranKXmyfVDu31SH7OEw/edit?gid=1705416226';
  const guarded=fn=>async e=>{const button=e?.currentTarget;if(button?.tagName==='BUTTON')button.disabled=true;try{await fn();}catch(error){el('gs-connection').textContent=error.message;}finally{if(button)button.disabled=false;}};
  const message=async msg=>{const r=await chrome.runtime.sendMessage(msg);if(!r?.ok)throw Error(r?.error||'시트 연결 실패');return r;};
@@ -164,6 +164,7 @@ async function createFloatingPanel(){
  el('btn-stop').onclick=guarded(async()=>{await chrome.storage.local.set({isRunning:false});await saveLog('■ 작업 중단 · 결과 기록은 재시도 가능','INFO');await message({action:'SHEET_SYNC'});});
  el('btn-skip').onclick=guarded(async()=>{const d=await chrome.storage.local.get(['runId','currentIndex','accounts','isRunning']);if(d.isRunning&&!(await chrome.runtime.sendMessage({action:'AUTH_OWNER'}))?.ok)throw Error('메인 리모컨에서 넘겨주세요.');if(!d.accounts?.[d.currentIndex||0])throw Error('넘길 계정이 없습니다.');const expected={runId:d.runId,currentIndex:d.currentIndex||0};await chrome.storage.local.set({skipRequested:{...expected,nonce:crypto.randomUUID()}});await message({action:'SKIP_ACCOUNT',expected});});
  el('gs-backlog-export').onclick=guarded(async()=>{const d=await chrome.storage.local.get(['sheetBacklog','sheetContext','accountResults','sheetSynced']);const pending={context:d.sheetContext,accountResults:d.accountResults,synced:d.sheetSynced,backlog:d.sheetBacklog||[]};const a=document.createElement('a');a.href=URL.createObjectURL(new Blob([JSON.stringify(pending,null,2)],{type:'application/json'}));a.download='genie_unsynced_results.json';a.click();setTimeout(()=>URL.revokeObjectURL(a.href),1000);});
+ el('gs-new-run').onclick=guarded(async()=>{await idle();if(!window.confirm('이 시간·헬퍼의 완료·넘김 기록을 초기화하고 전체 계정을 새로 작업할까요?'))return;await message({action:'SHEET_NEW_RUN'});await selectSheet();});
  el('gs-sync-now').onclick=guarded(async()=>{await message({action:'SHEET_SYNC'});});
  el('gs-log').onclick=guarded(async()=>{const data=await chrome.storage.local.get({logs:[]});const a=document.createElement('a');a.href=URL.createObjectURL(new Blob([data.logs.join('\n')],{type:'text/plain;charset=utf-8'}));a.download='genie_download_log_'+new Date().toISOString().replace(/[:.]/g,'-')+'.txt';a.click();setTimeout(()=>URL.revokeObjectURL(a.href),1000);});
  let open=el('genie-open-btn');if(!open){open=document.createElement('button');open.id='genie-open-btn';open.textContent='🎵 도우미 열기';open.style.cssText='position:fixed;bottom:12px;right:12px;z-index:2147483646;padding:9px;border:0;border-radius:20px;background:#1688df;color:white;';document.body.appendChild(open);}open.onclick=()=>{p.style.display='block';chrome.storage.local.set({panelHidden:false});};el('gs-hide').onclick=()=>{p.style.display='none';chrome.storage.local.set({panelHidden:true});};if(d.panelHidden)p.style.display='none';
@@ -188,7 +189,7 @@ async function updateDashboardUI(){
  const mark=v=>['o','x'].includes(v)?'<b style="color:'+(v==='o'?'#00872c':'#d52222')+'">'+v+'</b>':'';
  tbody.innerHTML=accounts.map((a,i)=>{const r=d.accountResults?.[a.id]||{};return '<tr style="background:'+(d.isRunning&&i===index?'#edf6ff':'white')+'"><td>'+escapeHtml(a.id)+'</td>'+['down','song','mv','album','artist'].map(k=>'<td>'+mark(r[k])+'</td>').join('')+'</tr>';}).join('')||'<tr><td colspan="6">시트 연결 후 시작하세요.</td></tr>';
  el('dash-log-box').textContent=(d.logs||[]).slice(-150).join('\n');el('dash-log-box').style.whiteSpace='pre-wrap';
- for(const id of ['gs-save','gs-url','gs-time','gs-helper'])el(id).disabled=!!d.isRunning;
+ for(const id of ['gs-save','gs-url','gs-time','gs-helper','gs-new-run'])el(id).disabled=!!d.isRunning;
 }
 
 function renderMark(val) {
@@ -309,7 +310,9 @@ async function handlePayment(data) {
   return false;
 }
 
-let navigationPending = false;
+let navigationPending = false,documentLeaving=false;
+window.addEventListener('pagehide',()=>{documentLeaving=true;},{once:true});
+function expectedNavigationError(error){return (navigationPending||documentLeaving)&&/페이지 연결이 변경되었습니다|실행 연결이 만료되었습니다|message port closed|context invalidated/i.test(String(error?.message||''));}
 function navigateTask(url, replace = false) {
   navigationPending = true;
   if (replace) window.location.replace(url);
@@ -451,7 +454,7 @@ async function processTask() {
 
 
   } catch (err) {
-    await saveLog(`❌ 오류 발생: ${err.message}`, 'ERROR');
+    if(!expectedNavigationError(err))await saveLog(`❌ 오류 발생: ${err.message}`, 'ERROR');
   } finally {
     isStepRunning = false;
   }
